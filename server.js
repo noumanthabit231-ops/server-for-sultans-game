@@ -5,66 +5,54 @@ const io = require("socket.io")(process.env.PORT || 3001, {
 let rooms = {}; 
 
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+  console.log("Connect:", socket.id);
   socket.emit("room_list", Object.values(rooms));
 
   socket.on("create_room", (data) => {
-    if (Object.keys(rooms).length >= 20) {
-      return socket.emit("error", "Лимит комнат исчерпан (макс. 20)");
-    }
     const roomId = `room_${Math.random().toString(36).substr(2, 5)}`;
     rooms[roomId] = { 
       id: roomId, 
-      name: data.name, 
-      players: [socket.id], // Сразу добавляем создателя
-      maxPlayers: data.limit || 10, 
+      name: data.name || "Sultan Battle", 
+      players: [socket.id], 
+      maxPlayers: Number(data.limit) || 10, 
       status: 'waiting' 
     };
     socket.join(roomId);
-    socket.emit("room_created", roomId);
-    socket.emit("join_success", rooms[roomId]); // Подтверждаем успех создателю
+    socket.emit("join_success", rooms[roomId]); 
     io.emit("room_list", Object.values(rooms));
+    console.log("Created:", roomId);
   });
 
-  socket.on("join_room", (roomId) => {
+  socket.on("join_room", (rawId) => {
+    // Защита: извлекаем строку, если пришел объект {id: '...'}
+    const roomId = typeof rawId === 'object' ? rawId.id : rawId;
+    console.log("Join Request for:", roomId);
+    
     const room = rooms[roomId];
-    if (room && room.players.length < room.maxPlayers) {
+    if (room) {
       socket.join(roomId);
-      if (!room.players.includes(socket.id)) {
-        room.players.push(socket.id);
-      }
+      if (!room.players.includes(socket.id)) room.players.push(socket.id);
       
-      // КРИТИЧЕСКИЙ МОМЕНТ: отправляем подтверждение клиенту
-      socket.emit("join_success", room); 
-      
-      // Уведомляем остальных в комнате
+      socket.emit("join_success", room); // ОТПРАВЛЯЕМ ПОДТВЕРЖДЕНИЕ
       io.to(roomId).emit("player_joined", room.players);
-      // Обновляем глобальный список
       io.emit("room_list", Object.values(rooms));
+      console.log("Join Success:", socket.id, "->", roomId);
     } else {
-      socket.emit("error", "Не удалось зайти: комната полна или не существует");
+      console.log("Join Failed: Room not found", roomId);
+      socket.emit("error", "Комната не найдена");
     }
   });
 
-  // Синхронизация данных в реальном времени
   socket.on("sync_data", (data) => {
-    // Пересылаем данные всем остальным в этой же комнате
-    socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
+    if (data.roomId) socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
   });
 
   socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
     for (let id in rooms) {
       if (rooms[id].players.includes(socket.id)) {
         rooms[id].players = rooms[id].players.filter(p => p !== socket.id);
-        
-        // Уведомляем оставшихся, что игрок вышел
-        io.to(id).emit("player_left", socket.id);
         io.to(id).emit("player_joined", rooms[id].players);
-
-        if (rooms[id].players.length === 0) {
-          delete rooms[id];
-        }
+        if (rooms[id].players.length === 0) delete rooms[id];
       }
     }
     io.emit("room_list", Object.values(rooms));
