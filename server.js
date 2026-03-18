@@ -126,6 +126,33 @@ io.on("connection", (socket) => {
     socket.broadcast.emit("remote_player_died", victimId);
   });
 
+  // --- СИНХРОНИЗАЦИЯ ПОСТРОЕК (БАШНИ И ЗАБОРЫ) ---
+  socket.on("building_placed", (buildingData) => {
+    // buildingData содержит: roomId, type, x, y, faction, health
+    console.log(`[BUILD] Игрок ${socket.id} построил ${buildingData.type} в комнате ${buildingData.roomId}`);
+    
+    // Рассылаем всем остальным в комнате данные о новой постройке
+    socket.to(buildingData.roomId).emit("remote_building_placed", { 
+      ownerId: socket.id, 
+      ...buildingData 
+    });
+  });
+
+  // --- СИНХРОНИЗАЦИЯ ПОВРЕЖДЕНИЙ ПОСТРОЕК ---
+  socket.on("building_hit", (data) => {
+    // data: { roomId, buildingId, damage }
+    const room = rooms[data.roomId];
+    if (room) {
+      // Транслируем всем, что постройку бьют
+      socket.to(data.roomId).emit("remote_building_hit", data);
+    }
+  });
+
+  socket.on("building_destroyed", (data) => {
+    // data: { roomId, buildingId }
+    socket.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+  });
+
   socket.on("disconnect", () => {
     for (const roomId in rooms) {
       const room = rooms[roomId];
