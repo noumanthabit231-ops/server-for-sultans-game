@@ -115,6 +115,17 @@ io.on("connection", (socket) => {
     }
   });
 
+  // --- СИНХРОНИЗАЦИЯ СМЕРТИ (EXECUTION) ---
+  socket.on("player_killed", (victimId) => {
+    console.log(`[FATALITY] Игрок ${socket.id} убил ${victimId}`);
+    
+    // Мгновенно шлем жертве команду умереть
+    io.to(victimId).emit("you_died"); 
+    
+    // Рассылаем всем остальным, что этот игрок труп (чтобы убрали его модельку)
+    socket.broadcast.emit("remote_player_died", victimId);
+  });
+
   socket.on("disconnect", () => {
     for (const roomId in rooms) {
       const room = rooms[roomId];
