@@ -97,5 +97,40 @@ io.on("connection", (socket) => {
   });
 });
 
+// --- СОБЫТИЕ: ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
+  socket.on("vote_rematch", (roomId) => {
+    // Находим комнату по ID
+    const room = rooms[roomId];
+
+    if (room && room.status === 'active') { // Реванш возможен только в конце боя
+      // Находим игрока, который проголосовал
+      const player = room.players.find(p => p.id === socket.id);
+
+      // Проверяем, не голосовал ли он уже
+      if (player && !player.votedForRematch) {
+        player.votedForRematch = true; // Отмечаем, что он проголосовал
+        room.rematchVotes = (room.rematchVotes || 0) + 1; // Увеличиваем счетчик
+        
+        console.log(`[VOTE REMATCH] Player ${socket.id} voted in room ${roomId}. Total: ${room.rematchVotes}/${room.players.length}`);
+
+        // Шлем обновленный счетчик ВСЕМ в комнате
+        io.to(roomId).emit("update_rematch_votes", {
+          votedPlayers: room.rematchVotes,
+          maxPlayers: room.players.length
+        });
+
+        // Проверяем, если проголосовали ВСЕ
+        if (room.rematchVotes >= room.players.length) {
+          console.log(`[REMATCH START] All players voted in room ${roomId}. Restarting match...`);
+          
+          // Логика перезапуска (например, возврат в LOBBY_WAITING или прямой старт)
+          room.rematchVotes = 0; // Сброс голосов
+          room.players.forEach(p => p.votedForRematch = false); // Сброс статуса голосования
+          // setGameState('LOBBY_WAITING'); // Или match_started
+        }
+      }
+    }
+  });
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`--- SULTAN ENGINE ONLINE: ${PORT} ---`));
