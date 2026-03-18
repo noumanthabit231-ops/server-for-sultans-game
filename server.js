@@ -1,18 +1,19 @@
 const io = require("socket.io")(process.env.PORT || 3001, {
-  cors: { origin: "*" }
+  cors: { origin: "*" },
+  pingTimeout: 60000, // Увеличиваем таймаут, чтобы вкладки не вылетали сразу
 });
 
 let rooms = {}; 
 
 io.on("connection", (socket) => {
-  console.log(">>> Новый Султан подключился:", socket.id);
+  console.log("Sultan connected:", socket.id);
   socket.emit("room_list", Object.values(rooms));
 
   socket.on("create_room", (data) => {
     const roomId = `room_${Math.random().toString(36).substr(2, 5)}`;
     rooms[roomId] = { 
       id: roomId, 
-      name: data.name || "Sultan Battle", 
+      name: data.name || "Sultan Match", 
       players: [socket.id], 
       maxPlayers: Number(data.limit) || 2, 
       status: 'waiting' 
@@ -20,7 +21,6 @@ io.on("connection", (socket) => {
     socket.join(roomId);
     socket.emit("join_success", rooms[roomId]); 
     io.emit("room_list", Object.values(rooms));
-    console.log(">>> Создана комната:", roomId);
   });
 
   socket.on("join_room", (rawId) => {
@@ -28,24 +28,22 @@ io.on("connection", (socket) => {
     const room = rooms[roomId];
 
     if (room && room.players.length < room.maxPlayers) {
-      socket.join(roomId);
       if (!room.players.includes(socket.id)) {
         room.players.push(socket.id);
       }
+      socket.join(roomId);
       
-      console.log(`>>> Игрок ${socket.id} вошел в ${roomId}. Всего: ${room.players.length}`);
-      
+      // Сначала подтверждаем вход лично игроку
       socket.emit("join_success", room); 
+      // Затем уведомляем всех в комнате (включая вошедшего)
       io.to(roomId).emit("player_joined", room.players);
       io.emit("room_list", Object.values(rooms));
 
-      // АВТО-СТАРТ: если набралось нужное количество людей
       if (room.players.length >= room.maxPlayers) {
-        console.log(">>> Комната полная! Начинаем отсчет...");
-        io.to(roomId).emit("start_countdown", 5); // 5 секунд до старта
+        io.to(roomId).emit("start_countdown", 5);
       }
     } else {
-      socket.emit("error", "Комната полна или не найдена");
+      socket.emit("error", "Room is full or doesn't exist");
     }
   });
 
@@ -56,16 +54,11 @@ io.on("connection", (socket) => {
   });
 
   socket.on("disconnect", () => {
-    console.log("<<< Султан ушел:", socket.id);
     for (let id in rooms) {
       if (rooms[id].players.includes(socket.id)) {
         rooms[id].players = rooms[id].players.filter(p => p !== socket.id);
         io.to(id).emit("player_joined", rooms[id].players);
-        
-        if (rooms[id].players.length === 0) {
-          console.log(">>> Комната пуста и удалена:", id);
-          delete rooms[id];
-        }
+        if (rooms[id].players.length === 0) delete rooms[id];
       }
     }
     io.emit("room_list", Object.values(rooms));
