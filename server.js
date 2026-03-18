@@ -56,11 +56,23 @@ io.on("connection", (socket) => {
     if (data.roomId) socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
   });
 
+  // Было так:
+  // socket.on("start_match_request", (roomId) => { ... });
+
+  // Сделай вот так:
   socket.on("start_match_request", (roomId) => {
     if (rooms[roomId] && rooms[roomId].hostId === socket.id) {
       rooms[roomId].status = 'starting';
       io.to(roomId).emit("start_countdown", 5);
       io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
+
+      // НОВОЕ: Сервер сам отсчитывает 5 секунд и командует СТАРТ
+      setTimeout(() => {
+        if (rooms[roomId]) {
+          rooms[roomId].status = 'active';
+          io.to(roomId).emit("match_started"); // ГЛАВНАЯ КОМАНДА
+        }
+      }, 5000);
     }
   });
 
