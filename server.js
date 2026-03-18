@@ -153,6 +153,16 @@ io.on("connection", (socket) => {
     socket.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
   });
 
+  socket.on("unit_hit", (data) => {
+    // data: { targetPlayerId, unitIndex, damage }
+    io.to(data.targetPlayerId).emit("take_unit_damage", data);
+  });
+
+  socket.on("tower_fire", (data) => {
+    // Рассылаем всем в комнате, что башня выстрелила (для визуала)
+    socket.broadcast.emit("remote_tower_fire", data);
+  });
+
   socket.on("disconnect", () => {
     for (const roomId in rooms) {
       const room = rooms[roomId];
