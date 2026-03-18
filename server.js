@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
-  pingTimeout: 60000, // Даем минуту на зависания вкладок
+  pingTimeout: 60000, 
   pingInterval: 15000,
   transports: ['websocket', 'polling']
 });
@@ -31,9 +31,7 @@ io.on("connection", (socket) => {
 
     socket.join(roomId);
     socket.emit("join_success", rooms[roomId]);
-    
-    // КРИТИЧНЫЙ ФИКС: Сразу шлем обновление, чтобы Хост себя нарисовал!
-    io.to(roomId).emit("room_update", rooms[roomId]);
+    io.to(roomId).emit("room_update", rooms[roomId]); // Отправляем ВСЕМУ лобби
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
 
