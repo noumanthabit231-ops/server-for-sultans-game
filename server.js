@@ -75,17 +75,20 @@ io.on("connection", (socket) => {
   });
 
   // --- ИСПРАВЛЕННЫЙ БЛОК: ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
+  // --- БЕЗОТКАЗНОЕ ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
   socket.on("vote_rematch", (roomId) => {
+    console.log(`[SERVER DEBUG] Получен сигнал vote_rematch от ${socket.id} для комнаты ${roomId}`);
     const room = rooms[roomId];
 
-    if (room && room.status === 'active') { 
+    // Убрали проверку room.status === 'active', просто проверяем что комната существует
+    if (room) { 
       const player = room.players.find(p => p.id === socket.id);
 
       if (player && !player.votedForRematch) {
         player.votedForRematch = true; 
         room.rematchVotes = (room.rematchVotes || 0) + 1; 
         
-        console.log(`[VOTE REMATCH] Player ${socket.id} voted in ${roomId}. Total: ${room.rematchVotes}/${room.players.length}`);
+        console.log(`[VOTE SUCCESS] Игрок ${socket.id} проголосовал. Итого: ${room.rematchVotes}/${room.players.length}`);
 
         // Шлем обновленный счетчик ВСЕМ в комнате
         io.to(roomId).emit("update_rematch_votes", {
@@ -95,17 +98,20 @@ io.on("connection", (socket) => {
 
         // Проверяем, если проголосовали ВСЕ
         if (room.rematchVotes >= room.players.length) {
-          console.log(`[REMATCH START] All players voted in ${roomId}. Restarting...`);
+          console.log(`[REMATCH START] Все проголосовали! Перезапуск комнаты ${roomId}`);
           
           room.rematchVotes = 0; 
-          room.status = 'lobby'; // Возвращаем статус лобби
+          room.status = 'lobby';
           room.players.forEach(p => p.votedForRematch = false); 
           
-          // Отправляем команду всем клиентам вернуться в лобби
           io.to(roomId).emit("rematch_started", room);
           io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
         }
+      } else {
+        console.log(`[VOTE REJECTED] Игрок не найден или уже голосовал: ${socket.id}`);
       }
+    } else {
+      console.log(`[VOTE REJECTED] Комната не найдена: ${roomId}`);
     }
   });
 
