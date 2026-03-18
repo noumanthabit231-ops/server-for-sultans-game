@@ -1,4 +1,4 @@
-// ФОРСИРУЕМ ОБНОВЛЕНИЕ СЕРВЕРА 1.0
+// ФОРСИРУЕМ ОБНОВЛЕНИЕ СЕРВЕРА 1.1 - РЕВАНШ РАБОТАЕТ
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -17,6 +17,8 @@ const rooms = {};
 app.get("/", (req, res) => res.send("Sultan Server Active"));
 
 io.on("connection", (socket) => {
+  // ВЕСЬ КОД ДОЛЖЕН БЫТЬ ВНУТРИ ЭТОЙ ФУНКЦИИ!
+  
   socket.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
 
   socket.on("create_room", (data) => {
@@ -26,13 +28,14 @@ io.on("connection", (socket) => {
       name: data.name || `Sultan_${roomId}`,
       hostId: socket.id,
       status: 'lobby',
-      players: [{ id: socket.id, name: "Great Agha", isHost: true, x: 600, y: 600 }],
-      maxPlayers: Number(data.limit) || 10
+      players: [{ id: socket.id, name: "Great Agha", isHost: true, x: 600, y: 600, votedForRematch: false }],
+      maxPlayers: Number(data.limit) || 10,
+      rematchVotes: 0
     };
 
     socket.join(roomId);
     socket.emit("join_success", rooms[roomId]);
-    io.to(roomId).emit("room_update", rooms[roomId]); // Отправляем ВСЕМУ лобби
+    io.to(roomId).emit("room_update", rooms[roomId]); 
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
 
@@ -44,7 +47,7 @@ io.on("connection", (socket) => {
     socket.join(roomId);
     const exists = room.players.find(p => p.id === socket.id);
     if (!exists) {
-      room.players.push({ id: socket.id, name: `Janissary_${socket.id.substring(0, 3)}`, isHost: false, x: 600, y: 600 });
+      room.players.push({ id: socket.id, name: `Janissary_${socket.id.substring(0, 3)}`, isHost: false, x: 600, y: 600, votedForRematch: false });
     }
 
     socket.emit("join_success", room);
@@ -56,23 +59,53 @@ io.on("connection", (socket) => {
     if (data.roomId) socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
   });
 
-  // Было так:
-  // socket.on("start_match_request", (roomId) => { ... });
-
-  // Сделай вот так:
   socket.on("start_match_request", (roomId) => {
     if (rooms[roomId] && rooms[roomId].hostId === socket.id) {
       rooms[roomId].status = 'starting';
       io.to(roomId).emit("start_countdown", 5);
       io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
 
-      // НОВОЕ: Сервер сам отсчитывает 5 секунд и командует СТАРТ
       setTimeout(() => {
         if (rooms[roomId]) {
           rooms[roomId].status = 'active';
-          io.to(roomId).emit("match_started"); // ГЛАВНАЯ КОМАНДА
+          io.to(roomId).emit("match_started"); 
         }
       }, 5000);
+    }
+  });
+
+  // --- ИСПРАВЛЕННЫЙ БЛОК: ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
+  socket.on("vote_rematch", (roomId) => {
+    const room = rooms[roomId];
+
+    if (room && room.status === 'active') { 
+      const player = room.players.find(p => p.id === socket.id);
+
+      if (player && !player.votedForRematch) {
+        player.votedForRematch = true; 
+        room.rematchVotes = (room.rematchVotes || 0) + 1; 
+        
+        console.log(`[VOTE REMATCH] Player ${socket.id} voted in ${roomId}. Total: ${room.rematchVotes}/${room.players.length}`);
+
+        // Шлем обновленный счетчик ВСЕМ в комнате
+        io.to(roomId).emit("update_rematch_votes", {
+          votedPlayers: room.rematchVotes,
+          maxPlayers: room.players.length
+        });
+
+        // Проверяем, если проголосовали ВСЕ
+        if (room.rematchVotes >= room.players.length) {
+          console.log(`[REMATCH START] All players voted in ${roomId}. Restarting...`);
+          
+          room.rematchVotes = 0; 
+          room.status = 'lobby'; // Возвращаем статус лобби
+          room.players.forEach(p => p.votedForRematch = false); 
+          
+          // Отправляем команду всем клиентам вернуться в лобби
+          io.to(roomId).emit("rematch_started", room);
+          io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
+        }
+      }
     }
   });
 
@@ -95,42 +128,7 @@ io.on("connection", (socket) => {
     }
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
-});
-
-// --- СОБЫТИЕ: ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
-  socket.on("vote_rematch", (roomId) => {
-    // Находим комнату по ID
-    const room = rooms[roomId];
-
-    if (room && room.status === 'active') { // Реванш возможен только в конце боя
-      // Находим игрока, который проголосовал
-      const player = room.players.find(p => p.id === socket.id);
-
-      // Проверяем, не голосовал ли он уже
-      if (player && !player.votedForRematch) {
-        player.votedForRematch = true; // Отмечаем, что он проголосовал
-        room.rematchVotes = (room.rematchVotes || 0) + 1; // Увеличиваем счетчик
-        
-        console.log(`[VOTE REMATCH] Player ${socket.id} voted in room ${roomId}. Total: ${room.rematchVotes}/${room.players.length}`);
-
-        // Шлем обновленный счетчик ВСЕМ в комнате
-        io.to(roomId).emit("update_rematch_votes", {
-          votedPlayers: room.rematchVotes,
-          maxPlayers: room.players.length
-        });
-
-        // Проверяем, если проголосовали ВСЕ
-        if (room.rematchVotes >= room.players.length) {
-          console.log(`[REMATCH START] All players voted in room ${roomId}. Restarting match...`);
-          
-          // Логика перезапуска (например, возврат в LOBBY_WAITING или прямой старт)
-          room.rematchVotes = 0; // Сброс голосов
-          room.players.forEach(p => p.votedForRematch = false); // Сброс статуса голосования
-          // setGameState('LOBBY_WAITING'); // Или match_started
-        }
-      }
-    }
-  });
+}); // <--- ВОТ ЗДЕСЬ ЗАКРЫВАЕТСЯ io.on
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`--- SULTAN ENGINE ONLINE: ${PORT} ---`));
