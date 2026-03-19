@@ -104,19 +104,25 @@ io.on("connection", (socket) => {
   });
 
   // --- СИСТЕМА ФИКСАЦИИ ПОБЕДЫ (БЕТОН) ---
+  // --- СИСТЕМА ФИКСАЦИИ ПОБЕДЫ (БЕТОН) ---
   socket.on("commander_death_detected", (data) => {
     // data: { roomId, winnerId, loserId }
     const room = rooms[data.roomId];
     
     if (room && room.status === 'active') {
-      console.log(`[BATTLE END] Султан ${data.loserId} пал. Победитель: ${data.winnerId}`);
+      // Ищем реальные имена победителя и проигравшего
+      const winner = room.players.find(p => p.id === data.winnerId);
+      const winnerName = winner ? winner.name : "Unknown Sultan";
+
+      console.log(`[BATTLE END] Султан ${data.loserId} пал. Победитель: ${winnerName}`);
       
       room.status = 'finished'; // Закрываем комнату на сервере
 
-      // Рассылаем приказ завершить игру ВСЕМ
+      // Рассылаем приказ завершить игру ВСЕМ, добавляя ИМЯ убийцы
       io.to(data.roomId).emit("game_over_final", {
         winnerId: data.winnerId,
-        loserId: data.loserId
+        loserId: data.loserId,
+        winnerName: winnerName // <-- ВОТ ОНО! Передаем имя
       });
     }
   });
