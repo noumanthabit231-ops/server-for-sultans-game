@@ -175,6 +175,20 @@ io.on("connection", (socket) => {
     socket.broadcast.emit("remote_tower_fire", data);
   });
 
+    // --- СИНХРОНИЗАЦИЯ ВОРОТ ---
+  socket.on("toggle_gate", (data) => {
+    // data: { roomId, buildingId, isOpen }
+    const room = rooms[data.roomId];
+    if (room) {
+      const gate = room.buildings.find(b => b.id === data.buildingId);
+      if (gate) {
+        gate.isOpen = data.isOpen;
+        // Рассылаем всем, чтобы ворота открылись/закрылись визуально
+        io.to(data.roomId).emit("remote_gate_toggled", data);
+      }
+    }
+  });
+
   socket.on("disconnect", () => {
     for (const roomId in rooms) {
       const room = rooms[roomId];
