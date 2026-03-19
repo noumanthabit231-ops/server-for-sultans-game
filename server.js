@@ -1,4 +1,4 @@
-// ФОРСИРУЕМ ОБНОВЛЕНИЕ СЕРВЕРА 1.1 - РЕВАНШ РАБОТАЕТ
+// SULTAN SERVER ENGINE v1.2 - AUTHORITATIVE TOWER FIRING
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -16,8 +16,40 @@ const rooms = {};
 
 app.get("/", (req, res) => res.send("Sultan Server Active"));
 
+// --- ГЛОБАЛЬНЫЙ ЦИКЛ СТРЕЛЬБЫ СЕРВЕРА (РАБОТАЕТ ВСЕГДА) ---
+setInterval(() => {
+  Object.values(rooms).forEach(room => {
+    if (room.status !== 'active') return;
+
+    room.buildings.forEach(tower => {
+      if (tower.type !== 'TOWER') return;
+
+      // Ищем цели среди игроков (кто не в той же фракции)
+      for (const player of room.players) {
+        if (player.faction === tower.faction) continue;
+
+        const dx = player.x - tower.x;
+        const dy = player.y - tower.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist < 400) { // Радиус атаки башни
+          // СЕРВЕР ПРИКАЗЫВАЕТ ВСЕМ КЛИЕНТАМ ОТРИСОВАТЬ ВЫСТРЕЛ
+          io.to(room.id).emit("remote_tower_fire", {
+            towerId: tower.id,
+            targetId: player.id,
+            targetX: player.x,
+            targetY: player.y,
+            startX: tower.x,
+            startY: tower.y
+          });
+          break; // Башня стреляет в первую найденную цель
+        }
+      }
+    });
+  });
+}, 1000); // Интервал стрельбы - 1 секунда
+
 io.on("connection", (socket) => {
-  // ВЕСЬ КОД ДОЛЖЕН БЫТЬ ВНУТРИ ЭТОЙ ФУНКЦИИ!
   
   socket.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
 
@@ -28,7 +60,16 @@ io.on("connection", (socket) => {
       name: data.name || `Sultan_${roomId}`,
       hostId: socket.id,
       status: 'lobby',
-      players: [{ id: socket.id, name: "Great Agha", isHost: true, x: 600, y: 600, votedForRematch: false }],
+      players: [{ 
+        id: socket.id, 
+        name: "Great Agha", 
+        isHost: true, 
+        x: 600, 
+        y: 600, 
+        faction: 'green', // дефолтная фракция
+        votedForRematch: false 
+      }],
+      buildings: [], // Список всех построек в комнате
       maxPlayers: Number(data.limit) || 10,
       rematchVotes: 0
     };
@@ -47,7 +88,15 @@ io.on("connection", (socket) => {
     socket.join(roomId);
     const exists = room.players.find(p => p.id === socket.id);
     if (!exists) {
-      room.players.push({ id: socket.id, name: `Janissary_${socket.id.substring(0, 3)}`, isHost: false, x: 600, y: 600, votedForRematch: false });
+      room.players.push({ 
+        id: socket.id, 
+        name: `Janissary_${socket.id.substring(0, 3)}`, 
+        isHost: false, 
+        x: 600, 
+        y: 600, 
+        faction: 'blue', // фракция для второго игрока
+        votedForRematch: false 
+      });
     }
 
     socket.emit("join_success", room);
@@ -55,8 +104,18 @@ io.on("connection", (socket) => {
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
 
+  // Обновляем координаты на сервере, чтобы он знал куда стрелять
   socket.on("sync_data", (data) => {
-    if (data.roomId) socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
+    const room = rooms[data.roomId];
+    if (room) {
+      const player = room.players.find(p => p.id === socket.id);
+      if (player) {
+        player.x = data.x;
+        player.y = data.y;
+        player.faction = data.faction;
+      }
+      socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
+    }
   });
 
   socket.on("start_match_request", (roomId) => {
@@ -74,93 +133,67 @@ io.on("connection", (socket) => {
     }
   });
 
-  // --- ИСПРАВЛЕННЫЙ БЛОК: ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
-  // --- БЕЗОТКАЗНОЕ ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
   socket.on("vote_rematch", (roomId) => {
-    console.log(`[SERVER DEBUG] Получен сигнал vote_rematch от ${socket.id} для комнаты ${roomId}`);
     const room = rooms[roomId];
-
-    // Убрали проверку room.status === 'active', просто проверяем что комната существует
     if (room) { 
       const player = room.players.find(p => p.id === socket.id);
-
       if (player && !player.votedForRematch) {
         player.votedForRematch = true; 
         room.rematchVotes = (room.rematchVotes || 0) + 1; 
-        
-        console.log(`[VOTE SUCCESS] Игрок ${socket.id} проголосовал. Итого: ${room.rematchVotes}/${room.players.length}`);
-
-        // Шлем обновленный счетчик ВСЕМ в комнате
         io.to(roomId).emit("update_rematch_votes", {
           votedPlayers: room.rematchVotes,
           maxPlayers: room.players.length
         });
 
-        // Проверяем, если проголосовали ВСЕ
         if (room.rematchVotes >= room.players.length) {
-          console.log(`[REMATCH START] Все проголосовали! Перезапуск комнаты ${roomId}`);
-          
           room.rematchVotes = 0; 
           room.status = 'lobby';
+          room.buildings = []; // Чистим карту при рестарте
           room.players.forEach(p => p.votedForRematch = false); 
-          
           io.to(roomId).emit("rematch_started", room);
           io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
         }
-      } else {
-        console.log(`[VOTE REJECTED] Игрок не найден или уже голосовал: ${socket.id}`);
       }
-    } else {
-      console.log(`[VOTE REJECTED] Комната не найдена: ${roomId}`);
     }
   });
 
-  // --- СИНХРОНИЗАЦИЯ СМЕРТИ (EXECUTION) ---
   socket.on("player_killed", (victimId) => {
-    console.log(`[FATALITY] Игрок ${socket.id} убил ${victimId}`);
-    
-    // Мгновенно шлем жертве команду умереть
     io.to(victimId).emit("you_died"); 
-    
-    // Рассылаем всем остальным, что этот игрок труп (чтобы убрали его модельку)
     socket.broadcast.emit("remote_player_died", victimId);
   });
 
-  // --- СИНХРОНИЗАЦИЯ ПОСТРОЕК (БАШНИ И ЗАБОРЫ) ---
+  // Сервер теперь сохраняет постройки у себя в памяти
   socket.on("building_placed", (buildingData) => {
-    // buildingData содержит: roomId, type, x, y, faction, health
-    console.log(`[BUILD] Игрок ${socket.id} построил ${buildingData.type} в комнате ${buildingData.roomId}`);
-    
-    // Рассылаем всем остальным в комнате данные о новой постройке
-    socket.to(buildingData.roomId).emit("remote_building_placed", { 
-      ownerId: socket.id, 
-      ...buildingData 
-    });
-  });
-
-  // --- СИНХРОНИЗАЦИЯ ПОВРЕЖДЕНИЙ ПОСТРОЕК ---
-  socket.on("building_hit", (data) => {
-    // data: { roomId, buildingId, damage }
-    const room = rooms[data.roomId];
+    const room = rooms[buildingData.roomId];
     if (room) {
-      // Транслируем всем, что постройку бьют
-      socket.to(data.roomId).emit("remote_building_hit", data);
+      const newBuilding = { 
+        ...buildingData, 
+        id: Math.random().toString(36).substring(7), 
+        ownerId: socket.id 
+      };
+      room.buildings.push(newBuilding);
+      io.to(buildingData.roomId).emit("remote_building_placed", newBuilding);
     }
   });
 
-  socket.on("building_destroyed", (data) => {
-    // data: { roomId, buildingId }
-    socket.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+  socket.on("building_hit", (data) => {
+    const room = rooms[data.roomId];
+    if (room) {
+      const b = room.buildings.find(b => b.id === data.buildingId);
+      if (b) {
+        b.health = (b.health || 100) - data.damage;
+        if (b.health <= 0) {
+          room.buildings = room.buildings.filter(item => item.id !== data.buildingId);
+          io.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+        } else {
+          socket.to(data.roomId).emit("remote_building_hit", data);
+        }
+      }
+    }
   });
 
   socket.on("unit_hit", (data) => {
-    // data: { targetPlayerId, unitIndex, damage }
     io.to(data.targetPlayerId).emit("take_unit_damage", data);
-  });
-
-  socket.on("tower_fire", (data) => {
-    // Рассылаем всем в комнате, что башня выстрелила (для визуала)
-    socket.broadcast.emit("remote_tower_fire", data);
   });
 
   socket.on("disconnect", () => {
@@ -182,7 +215,7 @@ io.on("connection", (socket) => {
     }
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
-}); // <--- ВОТ ЗДЕСЬ ЗАКРЫВАЕТСЯ io.on
+});
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`--- SULTAN ENGINE ONLINE: ${PORT} ---`));
