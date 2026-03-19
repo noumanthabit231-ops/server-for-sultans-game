@@ -150,11 +150,19 @@ io.on("connection", (socket) => {
 
   socket.on("building_destroyed", (data) => {
     // data: { roomId, buildingId }
-    console.log(`[DESTROY] Постройка ${data.buildingId} снесена в комнате ${data.roomId}`);
-    
-    // ВАЖНО: используем io.to().emit, чтобы сообщение получили ВСЕ, 
-    // включая того, кто сломал (для подтверждения)
-    io.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+    if (data.roomId && data.buildingId) {
+      console.log(`[NETWORK] Снос постройки ${data.buildingId} в комнате ${data.roomId}`);
+      
+      // Используем io.to(roomId), чтобы событие долетело до ВСЕХ в комнате.
+      // Это гарантирует, что даже если у кого-то лагало, забор исчезнет.
+      io.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+      
+      // Также чистим в памяти сервера (если используешь серверную стрельбу)
+      const room = rooms[data.roomId];
+      if (room && room.buildings) {
+        room.buildings = room.buildings.filter(b => b.id !== data.buildingId);
+      }
+    }
   });
 
   socket.on("unit_hit", (data) => {
