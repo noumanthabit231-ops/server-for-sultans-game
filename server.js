@@ -105,27 +105,46 @@ io.on("connection", (socket) => {
 
   // --- СИСТЕМА ФИКСАЦИИ ПОБЕДЫ (БЕТОН) ---
   // --- СИСТЕМА ФИКСАЦИИ ПОБЕДЫ (БЕТОН) ---
+  // --- СИСТЕМА ФИКСАЦИИ СМЕРТИ И ПОБЕДЫ (BATTLE ROYALE) ---
   socket.on("commander_death_detected", (data) => {
     // data: { roomId, winnerId, loserId }
     const room = rooms[data.roomId];
     
     if (room && room.status === 'active') {
-      // Ищем реальные имена победителя и проигравшего
+      const loser = room.players.find(p => p.id === data.loserId);
+      if (loser) loser.isAlive = false; // Помечаем как мертвого
+
       const winner = room.players.find(p => p.id === data.winnerId);
       const winnerName = winner ? winner.name : "Unknown Sultan";
 
-      console.log(`[BATTLE END] Султан ${data.loserId} пал. Победитель: ${winnerName}`);
-      
-      room.status = 'finished'; // Закрываем комнату на сервере
+      console.log(`[ELIMINATION] Султан ${data.loserId} убит игроком ${winnerName}`);
 
-      // Рассылаем приказ завершить игру ВСЕМ, добавляя ИМЯ убийцы
-      io.to(data.roomId).emit("game_over_final", {
-        winnerId: data.winnerId,
+      // 1. Сообщаем ВСЕМ, что конкретный игрок выбыл (чтобы он стал зрителем, а у других исчез)
+      io.to(data.roomId).emit("player_eliminated", {
         loserId: data.loserId,
-        winnerName: winnerName // <-- ВОТ ОНО! Передаем имя
+        winnerId: data.winnerId,
+        winnerName: winnerName
       });
+
+      // 2. Считаем, сколько Султанов осталось в живых
+      const alivePlayers = room.players.filter(p => p.isAlive !== false);
+
+      // Если остался только 1 живой (или 0, если убили друг друга)
+      if (alivePlayers.length <= 1) {
+        console.log(`[MATCH OVER] В комнате ${data.roomId} остался 1 выживший!`);
+        room.status = 'finished';
+
+        const finalWinner = alivePlayers[0] || winner; // Последний выживший
+
+        // 3. Объявляем финальную победу
+        io.to(data.roomId).emit("game_over_final", {
+          winnerId: finalWinner ? finalWinner.id : null,
+          winnerName: finalWinner ? finalWinner.name : "Draw"
+        });
+      }
     }
   });
+
 
   // --- ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
   socket.on("vote_rematch", (roomId) => {
@@ -146,9 +165,9 @@ io.on("connection", (socket) => {
           room.status = 'lobby';
           room.buildings = []; 
           room.players.forEach(p => {
-            p.votedForRematch = false;
-            p.hp = 100;
-          });
+       p.votedForRematch = false;
+       p.hp = 100;
+       p.isAlive = true;
           io.to(roomId).emit("rematch_started", room);
         }
       }
