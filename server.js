@@ -149,9 +149,13 @@ io.on("connection", (socket) => {
   });
 
   socket.on("building_destroyed", (data) => {
-    // data: { roomId, buildingId }
-    socket.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
-  });
+    // data: { roomId, buildingId }
+    console.log(`[DESTROY] Постройка ${data.buildingId} снесена в комнате ${data.roomId}`);
+    
+    // ВАЖНО: используем io.to().emit, чтобы сообщение получили ВСЕ, 
+    // включая того, кто сломал (для подтверждения)
+    io.to(data.roomId).emit("remote_building_destroyed", data.buildingId);
+  });
 
   socket.on("unit_hit", (data) => {
     // data: { targetPlayerId, unitIndex, damage }
