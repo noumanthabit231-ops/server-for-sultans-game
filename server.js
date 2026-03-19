@@ -1,5 +1,5 @@
 // ==========================================
-// SULTAN ENGINE v1.7 - SERVER AUTHORITY WIN
+// SULTAN ENGINE v1.7 - СЕРВЕРНАЯ ВЛАСТЬ (FULL)
 // ==========================================
 const express = require("express");
 const http = require("http");
@@ -19,7 +19,38 @@ const rooms = {};
 app.get("/", (req, res) => res.send("--- SULTAN ENGINE v1.7 ONLINE ---"));
 
 io.on("connection", (socket) => {
+  // При подключении отправляем список лобби
   socket.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
+
+  // --- ВНУТРЕННЯЯ ЛОГИКА ВХОДА (Чтобы не дублировать код) ---
+  function joinRoomInternal(socket, roomId, defaultName, isHost) {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    socket.join(roomId);
+
+    const player = {
+      id: socket.id,
+      name: defaultName,
+      isHost: isHost,
+      x: 600,
+      y: 600,
+      faction: isHost ? 'green' : 'blue',
+      votedForRematch: false,
+      hp: 100
+    };
+
+    room.players.push(player);
+
+    // Отправляем игроку ПОЛНЫЙ снимок комнаты
+    socket.emit("join_success", room);
+    
+    // Оповещаем остальных в комнате
+    io.to(roomId).emit("room_update", room);
+    
+    // Обновляем глобальный список лобби
+    io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
+  }
 
   // --- СОЗДАНИЕ КОМНАТЫ ---
   socket.on("create_room", (data) => {
@@ -35,6 +66,7 @@ io.on("connection", (socket) => {
       rematchVotes: 0,
       seed: Math.random()
     };
+
     joinRoomInternal(socket, roomId, "Great Agha", true);
   });
 
@@ -43,34 +75,20 @@ io.on("connection", (socket) => {
     const room = rooms[roomId];
     if (!room) return socket.emit("error", "Комната не найдена");
     if (room.status !== 'lobby') return socket.emit("error", "Битва уже идет!");
+    
     joinRoomInternal(socket, roomId, `Janissary_${socket.id.substring(0, 3)}`, false);
   });
 
-  function joinRoomInternal(socket, roomId, defaultName, isHost) {
-    const room = rooms[roomId];
-    socket.join(roomId);
-    const player = {
-      id: socket.id,
-      name: defaultName,
-      isHost: isHost,
-      x: 600, y: 600,
-      faction: isHost ? 'green' : 'blue',
-      votedForRematch: false,
-      hp: 100
-    };
-    room.players.push(player);
-    socket.emit("join_success", room);
-    io.to(roomId).emit("room_update", room);
-    io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
-  }
-
-  // --- СИНХРОНИЗАЦИЯ (20Hz Throttle) ---
+  // --- СИНХРОНИЗАЦИЯ ДАННЫХ ---
   socket.on("sync_data", (data) => {
     if (data.roomId && rooms[data.roomId]) {
       const p = rooms[data.roomId].players.find(player => player.id === socket.id);
       if (p) {
-        p.x = data.x; p.y = data.y; p.hp = data.hp;
+        p.x = data.x;
+        p.y = data.y;
+        p.hp = data.hp;
       }
+      // Транслируем всем остальным в комнате
       socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
     }
   });
@@ -90,13 +108,12 @@ io.on("connection", (socket) => {
     // data: { roomId, winnerId, loserId }
     const room = rooms[data.roomId];
     
-    // Проверяем, что комната существует и матч еще не помечен как законченный
     if (room && room.status === 'active') {
       console.log(`[BATTLE END] Султан ${data.loserId} пал. Победитель: ${data.winnerId}`);
       
-      room.status = 'finished'; // Официально закрываем матч на сервере
+      room.status = 'finished'; // Закрываем комнату на сервере
 
-      // Рассылаем УЛЬТИМАТИВНЫЙ приказ всем закончить игру
+      // Рассылаем приказ завершить игру ВСЕМ
       io.to(data.roomId).emit("game_over_final", {
         winnerId: data.winnerId,
         loserId: data.loserId
@@ -104,7 +121,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Реванш
+  // --- ГОЛОСОВАНИЕ ЗА РЕВАНШ ---
   socket.on("vote_rematch", (roomId) => {
     const room = rooms[roomId];
     if (room) { 
@@ -112,31 +129,48 @@ io.on("connection", (socket) => {
       if (player && !player.votedForRematch) {
         player.votedForRematch = true; 
         room.rematchVotes = (room.rematchVotes || 0) + 1; 
+
         io.to(roomId).emit("update_rematch_votes", {
           votedPlayers: room.rematchVotes,
           maxPlayers: room.players.length
         });
+
         if (room.rematchVotes >= room.players.length) {
           room.rematchVotes = 0; 
           room.status = 'lobby';
           room.buildings = []; 
-          room.players.forEach(p => { p.votedForRematch = false; p.hp = 100; });
+          room.players.forEach(p => {
+            p.votedForRematch = false;
+            p.hp = 100;
+          });
           io.to(roomId).emit("rematch_started", room);
         }
       }
     }
   });
 
-  // --- ПОСТРОЙКИ ---
+  // --- ПОСТРОЙКИ (УСТАНОВКА) ---
   socket.on("building_placed", (buildingData) => {
     const room = rooms[buildingData.roomId];
     if (room) {
-      const newBuilding = { ...buildingData, ownerId: socket.id, isOpen: false };
+      const newBuilding = { 
+        ...buildingData, 
+        ownerId: socket.id,
+        isOpen: false 
+      };
       room.buildings.push(newBuilding);
       io.to(buildingData.roomId).emit("remote_building_placed", newBuilding);
     }
   });
 
+  // --- ПОВРЕЖДЕНИЕ ПОСТРОЕК ---
+  socket.on("building_hit", (data) => {
+    if (data.roomId) {
+      socket.to(data.roomId).emit("remote_building_hit", data);
+    }
+  });
+
+  // --- СНОС ПОСТРОЕК ---
   socket.on("building_destroyed", (data) => {
     const room = rooms[data.roomId];
     if (room) {
@@ -145,31 +179,62 @@ io.on("connection", (socket) => {
     }
   });
 
+  // --- ВОРОТА (ОТКРЫТЬ/ЗАКРЫТЬ) ---
   socket.on("toggle_gate", (data) => {
+    // data: { roomId, buildingId, isOpen }
     const room = rooms[data.roomId];
     if (room) {
       const gate = room.buildings.find(b => b.id === data.buildingId);
       if (gate) {
         gate.isOpen = data.isOpen;
-        io.to(data.roomId).emit("remote_gate_toggled", data);
+        io.to(data.roomId).emit("remote_gate_toggled", {
+          buildingId: data.buildingId,
+          isOpen: data.isOpen
+        });
       }
     }
   });
 
-  // Прочие события
-  socket.on("unit_hit", (d) => io.to(d.targetPlayerId).emit("take_unit_damage", d));
-  socket.on("tower_fire", (d) => socket.to(d.roomId).emit("remote_tower_fire", d));
+  // --- БОЕВАЯ СИНХРОНИЗАЦИЯ (ЮНИТЫ И СТРЕЛЬБА) ---
+  socket.on("unit_hit", (data) => {
+    io.to(data.targetPlayerId).emit("take_unit_damage", data);
+  });
 
+  socket.on("tower_fire", (data) => {
+    socket.to(data.roomId).emit("remote_tower_fire", data);
+  });
+
+  socket.on("player_killed", (victimId) => {
+    // Старая функция для совместимости
+    io.to(victimId).emit("you_died"); 
+    socket.broadcast.emit("remote_player_died", victimId);
+  });
+
+  // --- ОТКЛЮЧЕНИЕ ИГРОКА ---
   socket.on("disconnect", () => {
-    for (const rid in rooms) {
-      const r = rooms[rid];
-      r.players = r.players.filter(p => p.id !== socket.id);
-      if (r.players.length === 0) delete rooms[rid];
-      else io.to(rid).emit("room_update", r);
+    for (const roomId in rooms) {
+      const room = rooms[roomId];
+      const playerIndex = room.players.findIndex(p => p.id === socket.id);
+      if (playerIndex !== -1) {
+        room.players.splice(playerIndex, 1);
+        
+        // Передача хоста, если создатель вышел
+        if (room.hostId === socket.id && room.players.length > 0) {
+          room.hostId = room.players[0].id;
+          room.players[0].isHost = true;
+        }
+
+        // Удаление комнаты, если она пуста
+        if (room.players.length === 0) {
+          delete rooms[roomId];
+        } else {
+          io.to(roomId).emit("room_update", room);
+        }
+      }
     }
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
 });
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`--- SULTAN ENGINE v1.7 ONLINE ---`));
+server.listen(PORT, () => console.log(`--- SULTAN ENGINE v1.7 ONLINE: ${PORT} ---`));
