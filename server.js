@@ -1,4 +1,3 @@
-// SULTAN SERVER ENGINE v1.2 - AUTHORITATIVE TOWER FIRING
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
@@ -14,26 +13,26 @@ const io = new Server(server, {
 
 const rooms = {};
 
-app.get("/", (req, res) => res.send("Sultan Server Active"));
+app.get("/", (req, res) => res.send("Sultan Server Engine v1.4 Active"));
 
-// --- ГЛОБАЛЬНЫЙ ЦИКЛ СТРЕЛЬБЫ СЕРВЕРА (РАБОТАЕТ ВСЕГДА) ---
+// --- ГЛОБАЛЬНЫЙ ЦИКЛ СЕРВЕРНОЙ ПОДДЕРЖКИ (Для фоновых вкладок) ---
 setInterval(() => {
   Object.values(rooms).forEach(room => {
-    if (room.status !== 'active') return;
+    if (room.status !== 'active' || !room.buildings) return;
 
     room.buildings.forEach(tower => {
       if (tower.type !== 'TOWER') return;
 
-      // Ищем цели среди игроков (кто не в той же фракции)
       for (const player of room.players) {
+        // Проверка фракций: башня не бьет своих
         if (player.faction === tower.faction) continue;
 
-        const dx = player.x - tower.x;
-        const dy = player.y - tower.y;
+        const dx = (player.x || 0) - tower.x;
+        const dy = (player.y || 0) - tower.y;
         const dist = Math.sqrt(dx * dx + dy * dy);
 
-        if (dist < 400) { // Радиус атаки башни
-          // СЕРВЕР ПРИКАЗЫВАЕТ ВСЕМ КЛИЕНТАМ ОТРИСОВАТЬ ВЫСТРЕЛ
+        if (dist < 450) { // Радиус башни
+          // Сервер сам инициирует выстрел, если видит цель
           io.to(room.id).emit("remote_tower_fire", {
             towerId: tower.id,
             targetId: player.id,
@@ -42,15 +41,16 @@ setInterval(() => {
             startX: tower.x,
             startY: tower.y
           });
-          break; // Башня стреляет в первую найденную цель
+          break; // Одна башня — одна цель в секунду
         }
       }
     });
   });
-}, 1000); // Интервал стрельбы - 1 секунда
+}, 1000);
 
 io.on("connection", (socket) => {
-  
+  console.log(`[CONNECT] New Sultan connected: ${socket.id}`);
+
   socket.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
 
   socket.on("create_room", (data) => {
@@ -66,14 +66,13 @@ io.on("connection", (socket) => {
         isHost: true, 
         x: 600, 
         y: 600, 
-        faction: 'green', // дефолтная фракция
+        faction: 'green',
         votedForRematch: false 
       }],
-      buildings: [], // Список всех построек в комнате
+      buildings: [],
       maxPlayers: Number(data.limit) || 10,
       rematchVotes: 0
     };
-
     socket.join(roomId);
     socket.emit("join_success", rooms[roomId]);
     io.to(roomId).emit("room_update", rooms[roomId]); 
@@ -94,17 +93,15 @@ io.on("connection", (socket) => {
         isHost: false, 
         x: 600, 
         y: 600, 
-        faction: 'blue', // фракция для второго игрока
+        faction: 'blue',
         votedForRematch: false 
       });
     }
-
     socket.emit("join_success", room);
     io.to(roomId).emit("room_update", room);
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
   });
 
-  // Обновляем координаты на сервере, чтобы он знал куда стрелять
   socket.on("sync_data", (data) => {
     const room = rooms[data.roomId];
     if (room) {
@@ -112,18 +109,17 @@ io.on("connection", (socket) => {
       if (player) {
         player.x = data.x;
         player.y = data.y;
-        player.faction = data.faction;
+        player.faction = data.faction || player.faction;
       }
       socket.to(data.roomId).emit("remote_update", { id: socket.id, ...data });
     }
   });
 
   socket.on("start_match_request", (roomId) => {
-    if (rooms[roomId] && rooms[roomId].hostId === socket.id) {
-      rooms[roomId].status = 'starting';
+    const room = rooms[roomId];
+    if (room && room.hostId === socket.id) {
+      room.status = 'starting';
       io.to(roomId).emit("start_countdown", 5);
-      io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
-
       setTimeout(() => {
         if (rooms[roomId]) {
           rooms[roomId].status = 'active';
@@ -144,42 +140,35 @@ io.on("connection", (socket) => {
           votedPlayers: room.rematchVotes,
           maxPlayers: room.players.length
         });
-
         if (room.rematchVotes >= room.players.length) {
           room.rematchVotes = 0; 
           room.status = 'lobby';
-          room.buildings = []; // Чистим карту при рестарте
+          room.buildings = []; 
           room.players.forEach(p => p.votedForRematch = false); 
           io.to(roomId).emit("rematch_started", room);
-          io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
         }
       }
     }
   });
 
-  socket.on("player_killed", (victimId) => {
-    io.to(victimId).emit("you_died"); 
-    socket.broadcast.emit("remote_player_died", victimId);
+  socket.on("player_killed", (vId) => {
+    io.to(vId).emit("you_died"); 
+    socket.broadcast.emit("remote_player_died", vId);
   });
 
-  // Сервер теперь сохраняет постройки у себя в памяти
-  socket.on("building_placed", (buildingData) => {
-    const room = rooms[buildingData.roomId];
+  socket.on("building_placed", (bData) => {
+    const room = rooms[bData.roomId];
     if (room) {
-      const newBuilding = { 
-        ...buildingData, 
-        id: Math.random().toString(36).substring(7), 
-        ownerId: socket.id 
-      };
-      room.buildings.push(newBuilding);
-      io.to(buildingData.roomId).emit("remote_building_placed", newBuilding);
+      const newB = { ...bData, id: "T-" + Math.random().toString(36).substring(7), ownerId: socket.id };
+      room.buildings.push(newB);
+      io.to(bData.roomId).emit("remote_building_placed", newB);
     }
   });
 
   socket.on("building_hit", (data) => {
     const room = rooms[data.roomId];
     if (room) {
-      const b = room.buildings.find(b => b.id === data.buildingId);
+      const b = room.buildings.find(item => item.id === data.buildingId);
       if (b) {
         b.health = (b.health || 100) - data.damage;
         if (b.health <= 0) {
@@ -196,21 +185,24 @@ io.on("connection", (socket) => {
     io.to(data.targetPlayerId).emit("take_unit_damage", data);
   });
 
+  // --- ТОТ САМЫЙ КРИТИЧЕСКИЙ ЛИСТЕНЕР ДЛЯ ВИЗУАЛА ---
+  socket.on("tower_fire", (data) => {
+    // Если клиент сам посчитал выстрел (в активной вкладке), транслируем всем
+    socket.to(data.roomId).emit("remote_tower_fire", data);
+  });
+
   socket.on("disconnect", () => {
-    for (const roomId in rooms) {
-      const room = rooms[roomId];
-      const playerIndex = room.players.findIndex(p => p.id === socket.id);
-      if (playerIndex !== -1) {
-        room.players.splice(playerIndex, 1);
-        if (room.hostId === socket.id && room.players.length > 0) {
+    for (const rid in rooms) {
+      const room = rooms[rid];
+      room.players = room.players.filter(p => p.id !== socket.id);
+      if (room.players.length === 0) {
+        delete rooms[rid];
+      } else {
+        if (room.hostId === socket.id) {
           room.hostId = room.players[0].id;
           room.players[0].isHost = true;
         }
-        if (room.players.length === 0) {
-          delete rooms[roomId];
-        } else {
-          io.to(roomId).emit("room_update", room);
-        }
+        io.to(rid).emit("room_update", room);
       }
     }
     io.emit("room_list", Object.values(rooms).filter(r => r.status === 'lobby'));
