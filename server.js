@@ -157,6 +157,14 @@ io.on("connection", (socket) => {
       io.to(d.roomId).emit("remote_building_destroyed", d.buildingId);
     }
   });
+
+    socket.on("garrison_destroyed", (d) => {
+    if (d.roomId) {
+      // Рассылаем всем в комнате, чтобы ВСЕ удалили этот отряд и поставили "надгробие"
+      io.to(d.roomId).emit("garrison_destroyed", d);
+    }
+  });
+  
   socket.on("toggle_gate", (d) => {
     const room = rooms[d.roomId];
     if (room) {
