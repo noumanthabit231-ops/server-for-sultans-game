@@ -164,6 +164,13 @@ io.on("connection", (socket) => {
       io.to(d.roomId).emit("garrison_destroyed", d);
     }
   });
+
+    // Рассылаем урон по отрядам ВСЕМ игрокам в комнате, чтобы они видели, как умирают воины
+  socket.on("garrison_hit", (d) => {
+    if (d.roomId) {
+      io.to(d.roomId).emit("remote_garrison_hit", d);
+    }
+  });
   
   socket.on("toggle_gate", (d) => {
     const room = rooms[d.roomId];
