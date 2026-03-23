@@ -101,35 +101,40 @@ io.on("connection", (socket) => {
     sendRoomList(); 
   } 
 
-  socket.on("create_room", (data) => { 
-    if (socket.isQueued) return; 
-    const roomId = Math.random().toString(36).substring(2, 7).toUpperCase(); 
-    rooms[roomId] = { 
-      id: roomId, 
-      name: data.name || `Sultan_${roomId}`, 
-      password: data.password || '', 
-      hostId: socket.id, 
-      status: 'lobby', 
-      players: [], 
-      buildings: [], 
-      maxPlayers: Number(data.limit) || 10, 
-      rematchVotes: 0, 
-      seed: Math.random() 
-    }; 
-    joinRoomInternal(socket, roomId, "Great Agha", true); 
-  }); 
+  // В СОЗДАНИИ КОМНАТЫ
+socket.on("create_room", (data) => { 
+  if (socket.isQueued) return; 
+  const roomId = Math.random().toString(36).substring(2, 7).toUpperCase(); 
+  rooms[roomId] = { 
+    id: roomId, 
+    name: data.name || `Sultan_${roomId}`, 
+    password: data.password || '', 
+    hostId: socket.id, 
+    status: 'lobby', 
+    players: [], 
+    buildings: [], 
+    maxPlayers: Number(data.limit) || 10, 
+    rematchVotes: 0, 
+    seed: Math.random() 
+  }; 
+  // ИСПОЛЬЗУЕМ ИМЯ ИЗ ДАННЫХ КЛИЕНТА (data.playerName)
+  joinRoomInternal(socket, roomId, data.playerName || "Great Agha", true); 
+}); 
 
-  socket.on("join_room", (data) => { 
-    if (socket.isQueued) return; 
-    const roomId = typeof data === 'string' ? data : data.roomId; 
-    const password = typeof data === 'string' ? '' : data.password; 
-    const room = rooms[roomId]; 
-    if (!room) return socket.emit("error", "Комната не найдена"); 
-    if (room.status !== 'lobby') return socket.emit("error", "Битва уже идет!"); 
-    if (room.password && room.password !== password) return socket.emit("error", "Неверный пароль!"); 
+// В ВХОДЕ В КОМНАТУ
+socket.on("join_room", (data) => { 
+  if (socket.isQueued) return; 
+  const roomId = typeof data === 'string' ? data : data.roomId; 
+  const password = typeof data === 'string' ? '' : data.password; 
+  const playerName = data.playerName || `Janissary_${socket.id.substring(0, 3)}`; // ИМЯ ИЗ КЛИЕНТА
 
-    joinRoomInternal(socket, roomId, `Janissary_${socket.id.substring(0, 3)}`, false); 
-  }); 
+  const room = rooms[roomId]; 
+  if (!room) return socket.emit("error", "Комната не найдена"); 
+  if (room.status !== 'lobby') return socket.emit("error", "Битва уже идет!"); 
+  if (room.password && room.password !== password) return socket.emit("error", "Неверный пароль!"); 
+
+  joinRoomInternal(socket, roomId, playerName, false); 
+}); 
 
   // ЯВНЫЙ ВЫХОД ИЗ КОМНАТЫ
   socket.on("leave_room", (roomId) => {
