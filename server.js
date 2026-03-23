@@ -179,37 +179,44 @@ socket.on("join_room", (data) => {
 // Внутри io.on('connection', (socket) => { ... })
 
 // Создание ямы (туннеля)
-socket.on('tunnel_update', (data) => {
-    const room = rooms[data.roomId];
-    if (room) {
-        if (!room.tunnels) room.tunnels = [];
-        const idx = room.tunnels.findIndex(t => t.id === data.id);
-        if (idx !== -1) {
-            room.tunnels[idx] = data;
-        } else {
-            room.tunnels.push(data);
-        }
-        // ВАЖНО: используем io.to().emit, чтобы получили ВСЕ игроки в комнате
-        io.to(data.roomId).emit('tunnel_update', data);
-    }
-});
+  // ==========================================
+  // СИНХРОНИЗАЦИЯ ЯМ (ТУННЕЛЕЙ) - ИСПРАВЛЕНО
+  // ==========================================
+  
+  socket.on("tunnel_update", (data) => { 
+    const room = rooms[data.roomId]; 
+    if (room) { 
+      if (!room.tunnels) room.tunnels = []; 
+      
+      const idx = room.tunnels.findIndex(t => t.id === data.id); 
+      if (idx !== -1) { 
+        room.tunnels[idx] = data; 
+      } else { 
+        room.tunnels.push(data); 
+      } 
+      
+      // ВАЖНО: Отправляем ВСЕМ ОСТАЛЬНЫМ в комнате (как при строительстве башен)
+      socket.to(data.roomId).emit("tunnel_update", data); 
+    } 
+  }); 
 
-// Удаление ямы
-socket.on('tunnel_remove', (data) => {
-    const room = rooms[data.roomId];
-    if (room && room.tunnels) {
-        room.tunnels = room.tunnels.filter(t => t.id !== data.id);
-        io.to(data.roomId).emit('tunnel_remove', { id: data.id });
-    }
-});
+  socket.on("tunnel_remove", (data) => { 
+    const room = rooms[data.roomId]; 
+    if (room && room.tunnels) { 
+      room.tunnels = room.tunnels.filter(t => t.id !== data.id); 
+      
+      // ВАЖНО: Отправляем ВСЕМ ОСТАЛЬНЫМ
+      socket.to(data.roomId).emit("tunnel_remove", { id: data.id }); 
+    } 
+  }); 
 
-// Запрос списка ям (для тех, кто только зашел)
-socket.on('request_tunnels', (data) => {
-    const room = rooms[data.roomId];
-    if (room && room.tunnels) {
-        socket.emit('sync_tunnels', { tunnels: room.tunnels });
-    }
-});
+  socket.on("request_tunnels", (data) => { 
+    const room = rooms[data.roomId]; 
+    if (room && room.tunnels) { 
+      // Отправляем только тому, кто запросил (кто только что зашел)
+      socket.emit("sync_tunnels", { tunnels: room.tunnels }); 
+    } 
+  });
       const alivePlayers = room.players.filter(p => p.isAlive !== false); 
       if (alivePlayers.length <= 1) { 
         room.status = 'finished'; 
