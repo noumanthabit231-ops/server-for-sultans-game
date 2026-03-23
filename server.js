@@ -172,6 +172,36 @@ socket.on("join_room", (data) => {
         loserId: data.loserId, winnerId: data.winnerId, winnerName: winnerName 
       }); 
 
+      // Внутри обработчика io.on('connection', (socket) => { ... })
+
+// Обработка создания/обновления норы
+socket.on('tunnel_update', (data) => {
+    const room = rooms[data.roomId];
+    if (room) {
+        if (!room.tunnels) room.tunnels = [];
+        const idx = room.tunnels.findIndex(t => t.id === data.id);
+        if (idx !== -1) {
+            room.tunnels[idx] = data; // Обновляем существующую
+        } else {
+            room.tunnels.push(data); // Добавляем новую
+        }
+        // Рассылаем всем в комнате
+        io.to(data.roomId).emit('tunnel_update', data);
+    }
+});
+
+// Обработка удаления норы
+socket.on('tunnel_remove', (data) => {
+    const room = rooms[data.roomId];
+    if (room) {
+        if (room.tunnels) {
+            room.tunnels = room.tunnels.filter(t => t.id !== data.id);
+        }
+        // Уведомляем всех об удалении
+        io.to(data.roomId).emit('tunnel_remove', { id: data.id });
+    }
+});
+
       const alivePlayers = room.players.filter(p => p.isAlive !== false); 
       if (alivePlayers.length <= 1) { 
         room.status = 'finished'; 
