@@ -175,33 +175,38 @@ socket.on("join_room", (data) => {
       // Внутри обработчика io.on('connection', (socket) => { ... })
 
 // Обработка создания/обновления норы
+// 1. Хранение и обновление ям на сервере
 socket.on('tunnel_update', (data) => {
     const room = rooms[data.roomId];
     if (room) {
         if (!room.tunnels) room.tunnels = [];
         const idx = room.tunnels.findIndex(t => t.id === data.id);
         if (idx !== -1) {
-            room.tunnels[idx] = data; // Обновляем существующую
+            room.tunnels[idx] = data;
         } else {
-            room.tunnels.push(data); // Добавляем новую
+            room.tunnels.push(data);
         }
-        // Рассылаем всем в комнате
+        // Рассылаем всем, включая отправителя для подтверждения
         io.to(data.roomId).emit('tunnel_update', data);
     }
 });
 
-// Обработка удаления норы
+// 2. Удаление ямы
 socket.on('tunnel_remove', (data) => {
     const room = rooms[data.roomId];
-    if (room) {
-        if (room.tunnels) {
-            room.tunnels = room.tunnels.filter(t => t.id !== data.id);
-        }
-        // Уведомляем всех об удалении
+    if (room && room.tunnels) {
+        room.tunnels = room.tunnels.filter(t => t.id !== data.id);
         io.to(data.roomId).emit('tunnel_remove', { id: data.id });
     }
 });
 
+// 3. Отправка полного списка ям по запросу (при входе игрока)
+socket.on('request_tunnels', (data) => {
+    const room = rooms[data.roomId];
+    if (room && room.tunnels) {
+        socket.emit('sync_tunnels', { tunnels: room.tunnels });
+    }
+});
       const alivePlayers = room.players.filter(p => p.isAlive !== false); 
       if (alivePlayers.length <= 1) { 
         room.status = 'finished'; 
