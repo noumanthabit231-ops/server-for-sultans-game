@@ -391,4 +391,11 @@ function joinRoomInternal(ws, roomId, defaultName, isHost) {
 }
 
 // Express для статики (Railway требует один порт, но для локальной отладки или проксирования полезно)
-app.listen(Number(PORT) + 1, () => console.log(`Express backup on ${Number(PORT) + 1}`));
+server.listen(Number(PORT), (token) => {
+  if (token) {
+    console.log(`--- SULTAN ENGINE v1.8.2 ONLINE ON PORT: ${PORT} ---`);
+  } else {
+    // Если ты видишь это сообщение в логах — значит порт занят другим процессом
+    console.error(`ЗАЙНЯТ ПОРТ: ${PORT}. Попробуй сделать Redeploy в Railway.`);
+  }
+});
