@@ -176,6 +176,9 @@ socket.on("join_room", (data) => {
 
 // Обработка создания/обновления норы
 // 1. Хранение и обновление ям на сервере
+// Внутри io.on('connection', (socket) => { ... })
+
+// Создание ямы (туннеля)
 socket.on('tunnel_update', (data) => {
     const room = rooms[data.roomId];
     if (room) {
@@ -186,12 +189,12 @@ socket.on('tunnel_update', (data) => {
         } else {
             room.tunnels.push(data);
         }
-        // Рассылаем всем, включая отправителя для подтверждения
+        // ВАЖНО: используем io.to().emit, чтобы получили ВСЕ игроки в комнате
         io.to(data.roomId).emit('tunnel_update', data);
     }
 });
 
-// 2. Удаление ямы
+// Удаление ямы
 socket.on('tunnel_remove', (data) => {
     const room = rooms[data.roomId];
     if (room && room.tunnels) {
@@ -200,7 +203,7 @@ socket.on('tunnel_remove', (data) => {
     }
 });
 
-// 3. Отправка полного списка ям по запросу (при входе игрока)
+// Запрос списка ям (для тех, кто только зашел)
 socket.on('request_tunnels', (data) => {
     const room = rooms[data.roomId];
     if (room && room.tunnels) {
