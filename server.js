@@ -268,14 +268,10 @@ const uWS = require('uWebSockets.js');
                  const attacker = room.players.find(p => p.id === data.attackerId); 
                  const victim = room.players.find(p => p.id === data.targetPlayerId); 
                  
-                 // --- RULE OF EQUAL LAYERS (v2.9.6) --- 
-                 // Damage passes ONLY if both attacker and victim are on the same level.
-                 if (attacker && victim) { 
-                   if (attacker.isUnderground !== victim.isUnderground) return; 
-                 } else if (victim && victim.isUnderground) { 
-                   // Towers (non-player sources) cannot hit underground victims 
-                   return; 
-                 } 
+                const sameLayer = attacker && victim
+                  ? attacker.isUnderground === victim.isUnderground
+                  : !(victim && victim.isUnderground);
+                if (!sameLayer) return;
  
                  let sourcePos = null; 
                  let maxDist = 350; 
@@ -295,24 +291,23 @@ const uWS = require('uWebSockets.js');
  
                  if (sourcePos && victim) { 
                    const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y); 
-                   if (dist > maxDist) return console.log(`[COMBAT ARBITER] Hit blocked: distance ${Math.floor(dist)} > ${maxDist}`); 
+                  if (dist > maxDist) return; 
                    
                    victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1)); 
                    data.currentHp = victim.hp; 
                    
-                   // Forced sync for underground hits (and surface)
                    broadcastToRoom(data.roomId, { 
                      type: "remote_hp_sync", 
                      data: { id: victim.id, hp: victim.hp } 
                    }); 
+
+                  broadcastToRoom(data.roomId, { type: "take_unit_damage", data }); 
  
                    if (victim.hp <= 0 && victim.isAlive !== false) { 
                       handleCommanderDeath(room, victim.id, data.attackerId); 
                    } 
                  } 
                } 
-               // Always broadcast take_unit_damage for instant UI feedback
-               broadcastToRoom(data.roomId, { type: "take_unit_damage", data }); 
              } 
              break; 
            } 
