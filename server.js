@@ -254,6 +254,7 @@ function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
 
   ws.subscribe(roomId);
   ws.roomId = roomId;
+  const initialIsUnderground = false;
 
   const player = {
     id: ws.id,
@@ -265,7 +266,7 @@ function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
     votedForRematch: false,
     hp: 100,
     isAlive: true,
-    isUnderground: false,
+    isUnderground: initialIsUnderground,
     unitCount: 1,
     empireId: null
   };
@@ -385,7 +386,7 @@ server.ws('/*', {
         if (typeof syncData.y === 'number') player.y = syncData.y;
         if (typeof syncData.hp === 'number') player.hp = syncData.hp;
         if (typeof syncData.unitCount === 'number') player.unitCount = syncData.unitCount;
-        if (typeof syncData.isUnderground === 'boolean') player.isUnderground = syncData.isUnderground;
+        player.isUnderground = syncData.isUnderground ?? false;
         if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
         if (syncData.empireId) player.empireId = syncData.empireId;
         if (syncData.faction) player.faction = syncData.faction;
