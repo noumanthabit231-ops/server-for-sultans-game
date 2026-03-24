@@ -9,7 +9,6 @@ const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 const COMMANDER_MAX_HP = 500;
 const COMMANDER_HIT_DAMAGE = 100;
-const HIT_RANGE_BUFFER_MULTIPLIER = 1.2;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -521,6 +520,21 @@ server.ws('/*', {
           break;
         }
 
+        case 'pickup_unit': {
+          const roomId = data.roomId || ws.roomId;
+          const room = rooms.get(roomId);
+          if (!room) break;
+
+          const player = room.players.find((entry) => entry.id === ws.id);
+          if (!player) break;
+
+          player.unitCount = Math.max(0, Math.floor(player.unitCount || 0)) + 1;
+          broadcastPlayerState(server, room, player, {
+            recruitedIds: Array.isArray(data.recruitedIds) ? data.recruitedIds : []
+          });
+          break;
+        }
+
         case 'start_match_request': {
           const roomId = typeof data === 'string' ? data : data.roomId;
           const room = rooms.get(roomId);
@@ -587,19 +601,19 @@ server.ws('/*', {
               if (!sameLayer) return;
 
               let sourcePos = null;
-              let maxDist = 350 * HIT_RANGE_BUFFER_MULTIPLIER;
+              let maxDist = 250;
 
               if (data.attackerId === 'tower') {
                 const towers = room.buildings.filter((building) => building.ownerId === ws.id && building.type !== 'WALL' && building.type !== 'GATE');
-                const nearestTower = towers.find((tower) => getDistance(tower.x, tower.y, victim.x, victim.y) < 850 * HIT_RANGE_BUFFER_MULTIPLIER);
+                const nearestTower = towers.find((tower) => getDistance(tower.x, tower.y, victim.x, victim.y) < 850);
                 if (nearestTower) {
                   sourcePos = { x: nearestTower.x, y: nearestTower.y };
-                  maxDist = 850 * HIT_RANGE_BUFFER_MULTIPLIER;
+                  maxDist = 850;
                 }
               } else if (attacker) {
                 sourcePos = { x: attacker.x, y: attacker.y };
                 const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
-                maxDist = (armyRadius + 100) * HIT_RANGE_BUFFER_MULTIPLIER;
+                maxDist = Math.max(250, armyRadius + 100);
               }
 
               if (sourcePos && victim) {
