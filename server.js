@@ -15,48 +15,6 @@ const waitingQueue = [];
 // Хранилище комнат и игроков через Map() для мгновенного поиска
 const rooms = new Map(); 
 
-// Вспомогательная функция для распаковки бинарных данных (25 байт)
-function unpackSyncData(message) {
-  // message в uWS — это ArrayBuffer
-  const view = new DataView(message);
-  return {
-    shortId: view.getUint32(0, true),
-    x: view.getFloat32(4, true),
-    y: view.getFloat32(8, true),
-    rotation: view.getFloat32(12, true),
-    hp: view.getFloat32(16, true),
-    unitCount: view.getUint32(20, true),
-    isUnderground: view.getUint8(24) === 1 // БИТ ПОДЗЕМЕЛЬЯ
-  };
-}
-
-// Вынос логики смерти в отдельную функцию для Authority
-function handleCommanderDeath(room, loserId, winnerId = null) {
-  if (room.status !== 'active') return;
-  
-  const loser = room.players.find(p => p.id === loserId);
-  if (!loser || loser.isAlive === false) return;
-  
-  loser.isAlive = false;
-  const winner = room.players.find(p => p.id === winnerId);
-  const winnerName = winner ? winner.name : "Enemy";
-
-  broadcastToRoom(room.id, { 
-    type: "player_eliminated", 
-    data: { loserId: loserId, winnerId: winnerId, winnerName: winnerName } 
-  });
-
-  const alivePlayers = room.players.filter(p => p.isAlive !== false);
-  if (alivePlayers.length <= 1) {
-    room.status = 'finished';
-    const finalWinner = alivePlayers[0] || winner;
-    broadcastToRoom(room.id, { 
-      type: "game_over_final", 
-      data: { winnerId: finalWinner ? finalWinner.id : null, winnerName: finalWinner ? finalWinner.name : "Draw" } 
-    });
-  }
-}
-
 app.get("/", (req, res) => res.send(`--- SULTAN ENGINE v1.8.2 ONLINE | PLAYERS: ${activeConnections}/${MAX_GLOBAL_PLAYERS} ---`)); 
 
 // Вспомогательная функция для логики выхода игрока из комнаты 
@@ -155,27 +113,8 @@ const server = uWS.App().ws('/*', {
     // ВЫСОКОЧАСТОТНЫЕ ДАННЫЕ (БИНАРНЫЕ)
     if (isBinary) {
       if (ws.roomId) {
-        // TOTAL BINARY BROADCAST: Мгновенная пересылка байтов всем в комнате (uWS mode)
+        // Просто перекидываем байты в комнату без парсинга (БЕЗУМНАЯ СКОРОСТЬ)
         ws.publish(ws.roomId, message, true);
-
-        // РАСПАКОВКА И ОБНОВЛЕНИЕ ПАМЯТИ СЕРВЕРА (Арбитраж)
-        const room = rooms.get(ws.roomId);
-        if (room) {
-          const syncData = unpackSyncData(message);
-          const p = room.players.find(player => player.shortId === syncData.shortId);
-          if (p) {
-            p.x = syncData.x;
-            p.y = syncData.y;
-            p.hp = syncData.hp;
-            p.unitCount = syncData.unitCount;
-            p.isUnderground = syncData.isUnderground; // ОБНОВЛЯЕМ СОСТОЯНИЕ В ПАМЯТИ
-
-            // SERVER AUTHORITY: Смерть при достижении 0 юнитов
-            if (p.unitCount === 0 && p.isAlive !== false && room.status === 'active') {
-               handleCommanderDeath(room, p.id);
-            }
-          }
-        }
       }
       return;
     }
@@ -252,63 +191,35 @@ const server = uWS.App().ws('/*', {
           break;
         }
 
-        // --- БОЕВКА И СМЕРТИ (Арбитраж) ---
+        // --- БОЕВКА И СМЕРТИ ---
         case 'commander_death_detected': {
           const room = rooms.get(data.roomId);
-          if (room) handleCommanderDeath(room, data.loserId, data.winnerId);
+          if (room && room.status === 'active') {
+            const loser = room.players.find(p => p.id === data.loserId);
+            if (loser) loser.isAlive = false;
+            const winner = room.players.find(p => p.id === data.winnerId);
+            const winnerName = winner ? winner.name : "Enemy";
+
+            broadcastToRoom(data.roomId, { 
+              type: "player_eliminated", 
+              data: { loserId: data.loserId, winnerId: data.winnerId, winnerName: winnerName } 
+            });
+
+            const alivePlayers = room.players.filter(p => p.isAlive !== false);
+            if (alivePlayers.length <= 1) {
+              room.status = 'finished';
+              const finalWinner = alivePlayers[0] || winner;
+              broadcastToRoom(data.roomId, { 
+                type: "game_over_final", 
+                data: { winnerId: finalWinner ? finalWinner.id : null, winnerName: finalWinner ? finalWinner.name : "Draw" } 
+              });
+            }
+          }
           break;
         }
 
         case 'unit_hit': {
-          if (data.roomId) {
-            const room = rooms.get(data.roomId);
-            if (room) {
-              const attacker = room.players.find(p => p.id === data.attackerId);
-              const victim = room.players.find(p => p.id === data.targetPlayerId);
-              
-              let sourcePos = null;
-              let maxDist = 350; // Базовое расстояние для меча
-
-              // Если атака от башни
-              if (data.attackerId === 'tower') {
-                 // В данных башни ищем ту, что ближе всего к месту удара (или по ID если добавим)
-                 // Для простоты берем любую башню атакующего в радиусе поражения
-                 const towers = room.buildings.filter(b => b.ownerId === ws.id && b.type !== 'WALL' && b.type !== 'GATE');
-                 const nearestTower = towers.find(t => {
-                    const d = Math.sqrt((t.x - victim.x)**2 + (t.y - victim.y)**2);
-                    return d < 850; // Радиус башни + запас
-                 });
-                 if (nearestTower) {
-                    sourcePos = { x: nearestTower.x, y: nearestTower.y };
-                    maxDist = 850;
-                 }
-              } else if (attacker) {
-                 sourcePos = { x: attacker.x, y: attacker.y };
-                 // Учитываем радиус армии (Кнопка C)
-                 const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
-                 maxDist = armyRadius + 100; 
-              }
-
-              if (sourcePos && victim) {
-                // ПОДЗЕМЕЛЬЕ: Игнорируем урон, если цель под землей
-                if (victim.isUnderground) {
-                  return console.log(`[COMBAT ARBITER] Hit blocked: victim ${victim.id} is underground`);
-                }
-
-                const dist = Math.sqrt((sourcePos.x - victim.x)**2 + (sourcePos.y - victim.y)**2);
-                if (dist > maxDist) return console.log(`[COMBAT ARBITER] Hit blocked: distance ${Math.floor(dist)} > ${maxDist}`);
-                
-                // ОБНОВЛЕНИЕ HP В ПАМЯТИ СЕРВЕРА
-                victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
-                data.currentHp = victim.hp; // Добавляем актуальное HP в пакет для рассылки
-                
-                if (victim.hp <= 0 && victim.isAlive !== false) {
-                   handleCommanderDeath(room, victim.id, data.attackerId);
-                }
-              }
-            }
-            broadcastToRoom(data.roomId, { type: "take_unit_damage", data });
-          }
+          if (data.roomId) broadcastToRoom(data.roomId, { type: "take_unit_damage", data });
           break;
         }
 
@@ -470,8 +381,7 @@ function joinRoomInternal(ws, roomId, defaultName, isHost) {
     shortId: ws.shortId,
     name: defaultName, isHost: isHost, 
     x: 600, y: 600, faction: isHost ? 'green' : 'blue', 
-    votedForRematch: false, hp: 100, isAlive: true,
-    isUnderground: false // ИНИЦИАЛИЗАЦИЯ
+    votedForRematch: false, hp: 100, isAlive: true 
   }; 
   room.players.push(player); 
   
@@ -481,4 +391,11 @@ function joinRoomInternal(ws, roomId, defaultName, isHost) {
 }
 
 // Express для статики (Railway требует один порт, но для локальной отладки или проксирования полезно)
-app.listen(Number(PORT) + 1, () => console.log(`Express backup on ${Number(PORT) + 1}`));
+server.listen(Number(PORT), (token) => {
+  if (token) {
+    console.log(`--- SULTAN ENGINE v1.8.2 ONLINE ON PORT: ${PORT} ---`);
+  } else {
+    // Если ты видишь это сообщение в логах — значит порт занят другим процессом
+    console.error(`ЗАЙНЯТ ПОРТ: ${PORT}. Попробуй сделать Redeploy в Railway.`);
+  }
+});
