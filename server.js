@@ -625,7 +625,8 @@ server.ws('/*', {
                     send(targetWs, 'take_unit_damage', {
                       ...data,
                       currentHp: victim.hp,
-                      currentUnitCount: victim.unitCount
+                      currentUnitCount: victim.unitCount,
+                      serverMessage: `Тебя ударили, у тебя теперь ${victim.unitCount} воинов и ${victim.hp} здоровья`
                     });
                   }
 
@@ -653,7 +654,8 @@ server.ws('/*', {
                   send(targetWs, 'take_unit_damage', {
                     ...data,
                     currentHp: victim.hp,
-                    currentUnitCount: victim.unitCount
+                    currentUnitCount: victim.unitCount,
+                    serverMessage: `Тебя ударили, у тебя теперь ${victim.unitCount} воинов и ${victim.hp} здоровья`
                   });
                 }
 
