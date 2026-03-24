@@ -353,20 +353,13 @@ const server = uWS.App().ws('/*', {
           break;
         }
 
-        // --- ПОСТРОЙКИ И ЯМЫ ---
+        // --- ПОСТРОЙКИ ---
         case 'building_placed': {
           const room = rooms.get(data.roomId);
           if (room) {
-            if (data.type === 'tunnel' || data.type === 'pit') {
-               if (!room.tunnels) room.tunnels = [];
-               const newTunnel = { ...data, ownerId: ws.id };
-               room.tunnels.push(newTunnel);
-               broadcastToRoom(data.roomId, { type: "remote_tunnel_update", data: newTunnel });
-            } else {
-               const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
-               room.buildings.push(newBuilding);
-               broadcastToRoom(data.roomId, { type: "remote_building_placed", data: newBuilding });
-            }
+            const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
+            room.buildings.push(newBuilding);
+            broadcastToRoom(data.roomId, { type: "remote_building_placed", data: newBuilding });
           }
           break;
         }
@@ -379,31 +372,8 @@ const server = uWS.App().ws('/*', {
         case 'building_destroyed': {
           const room = rooms.get(data.roomId);
           if (room) {
-            // Сначала ищем в постройках
-            const initialLen = room.buildings.length;
             room.buildings = room.buildings.filter(b => b.id !== data.buildingId);
-            
-            if (room.buildings.length < initialLen) {
-               broadcastToRoom(data.roomId, { type: "remote_building_destroyed", data: data.buildingId });
-            } else {
-               // Если не нашли в постройках, ищем в туннелях (ямах)
-               if (room.tunnels) {
-                 const tLen = room.tunnels.length;
-                 room.tunnels = room.tunnels.filter(t => t.id !== data.buildingId);
-                 if (room.tunnels.length < tLen) {
-                   broadcastToRoom(data.roomId, { type: "remote_tunnel_remove", data: { id: data.buildingId } });
-                 }
-               }
-            }
-          }
-          break;
-        }
-
-        case 'hide_pit': {
-          const room = rooms.get(data.roomId);
-          if (room && room.tunnels) {
-            room.tunnels = room.tunnels.filter(t => t.id !== data.id);
-            broadcastToRoom(data.roomId, { type: "remote_tunnel_remove", data: { id: data.id } });
+            broadcastToRoom(data.roomId, { type: "remote_building_destroyed", data: data.buildingId });
           }
           break;
         }
