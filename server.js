@@ -1,6 +1,6 @@
 const uWS = require('uWebSockets.js');
 
-const PORT = process.env.PORT || 3001; 
+const PORT = process.env.PORT || 3000; 
 
 // ГЛОБАЛЬНЫЕ ЛИМИТЫ 
 const MAX_GLOBAL_PLAYERS = 1000; 
