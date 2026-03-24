@@ -387,7 +387,6 @@ server.ws('/*', {
       if (player) {
         if (typeof syncData.x === 'number') player.x = syncData.x;
         if (typeof syncData.y === 'number') player.y = syncData.y;
-        if (typeof syncData.hp === 'number') player.hp = syncData.hp;
         player.isUnderground = syncData.isUnderground ?? false;
         if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
         if (syncData.empireId) player.empireId = syncData.empireId;
@@ -564,11 +563,12 @@ server.ws('/*', {
           const room = rooms.get(data.roomId);
           if (room) {
             const victim = room.players.find((player) => player.id === data.id);
-            if (victim) victim.hp = data.hp;
-            broadcastToRoom(server, data.roomId, {
-              type: 'remote_hp_sync',
-              data: { id: data.id, hp: data.hp }
-            });
+            if (victim) {
+              broadcastToRoom(server, data.roomId, {
+                type: 'remote_hp_sync',
+                data: { id: victim.id, hp: victim.hp }
+              });
+            }
           }
           break;
         }
