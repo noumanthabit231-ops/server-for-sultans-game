@@ -9,6 +9,10 @@ const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 const COMMANDER_MAX_HP = 500;
 const COMMANDER_HIT_DAMAGE = 100;
+const WORLD_STATE_INTERVAL_MS = 50;
+const NPC_MOVE_SPEED = 10;
+const NPC_MELEE_RANGE = 85;
+const PIT_DAMAGE_COOLDOWN_MS = 350;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -31,6 +35,7 @@ function serializeRoom(room) {
     players: room.players,
     buildings: room.buildings,
     tunnels: room.tunnels || [],
+    npcGroups: room.npcGroups || [],
     maxPlayers: room.maxPlayers,
     rematchVotes: room.rematchVotes,
     seed: room.seed
@@ -131,6 +136,231 @@ function broadcastPlayerState(server, room, player, extraData = {}) {
       faction: player.faction,
       empireId: player.empireId,
       name: player.name
+    }
+  });
+}
+
+function serializeWorldState(room) {
+  return {
+    roomId: room.id,
+    players: room.players.map((player) => ({
+      id: player.id,
+      name: player.name,
+      type: 'player',
+      x: player.x,
+      y: player.y,
+      rotation: player.rotation || 0,
+      hp: Number.isFinite(player.hp) ? player.hp : COMMANDER_MAX_HP,
+      unitCount: Math.max(0, Math.floor(player.unitCount || 0)),
+      isAlive: player.isAlive !== false,
+      isUnderground: !!player.isUnderground,
+      faction: player.faction,
+      empireId: player.empireId || 'neutral',
+      isAttacking: !!player.isAttacking,
+      isDashing: !!player.isDashing,
+      akce: Number.isFinite(player.akce) ? player.akce : 0,
+      equippedItem: player.equippedItem
+    })),
+    npcGroups: (room.npcGroups || []).map((npc) => ({
+      id: npc.id,
+      name: npc.name,
+      type: 'ai',
+      x: npc.x,
+      y: npc.y,
+      rotation: npc.rotation || 0,
+      hp: COMMANDER_MAX_HP,
+      unitCount: Math.max(0, Math.floor(npc.unitCount || 0)),
+      isUnderground: false,
+      faction: npc.faction,
+      empireId: npc.empireId || 'neutral',
+      isAttacking: !!npc.isAttacking,
+      isDashing: false,
+      akce: 0
+    })),
+    buildings: room.buildings || [],
+    tunnels: room.tunnels || []
+  };
+}
+
+function sendWorldState(server, room) {
+  if (!room || room.status !== 'active') return;
+  broadcastToRoom(server, room.id, {
+    type: 'world_state',
+    data: serializeWorldState(room)
+  });
+}
+
+function initRoomWorld(room) {
+  if (!room) return;
+  if (!Array.isArray(room.npcGroups)) room.npcGroups = [];
+  if (room.npcGroups.length > 0) return;
+
+  room.npcGroups = [
+    {
+      id: `npc_${room.id}_0`,
+      name: 'Raiders Alpha',
+      x: 350,
+      y: 350,
+      rotation: 0,
+      unitCount: 24,
+      faction: '#f97316',
+      empireId: 'neutral',
+      targetId: null,
+      isAttacking: false,
+      lastPitDamageAt: 0
+    },
+    {
+      id: `npc_${room.id}_1`,
+      name: 'Raiders Beta',
+      x: 850,
+      y: 850,
+      rotation: Math.PI,
+      unitCount: 18,
+      faction: '#dc2626',
+      empireId: 'neutral',
+      targetId: null,
+      isAttacking: false,
+      lastPitDamageAt: 0
+    }
+  ];
+}
+
+function applyDamage(server, room, targetId, amount, metadata = {}) {
+  if (!room || !targetId) return null;
+
+  const player = room.players.find((entry) => entry.id === targetId);
+  if (player) {
+    const hitCount = Math.max(1, Math.floor(amount || 1));
+    for (let i = 0; i < hitCount; i++) {
+      if (player.unitCount > 0) {
+        player.unitCount -= 1;
+      } else {
+        player.hp = Math.max(0, (Number.isFinite(player.hp) ? player.hp : COMMANDER_MAX_HP) - COMMANDER_HIT_DAMAGE);
+      }
+    }
+
+    broadcastPlayerState(server, room, player, {
+      currentHp: player.hp,
+      currentUnitCount: player.unitCount,
+      source: metadata.source || 'applyDamage'
+    });
+
+    const targetWs = socketsById.get(player.id);
+    if (targetWs) {
+      send(targetWs, 'take_unit_damage', {
+        roomId: room.id,
+        targetPlayerId: player.id,
+        attackerId: metadata.attackerId || null,
+        attackerName: metadata.attackerName || 'Enemy',
+        currentHp: player.hp,
+        currentUnitCount: player.unitCount,
+        serverMessage: `Тебя ударили, у тебя теперь ${player.unitCount} воинов и ${player.hp} здоровья`
+      });
+    }
+
+    if (player.hp <= 0 && player.isAlive !== false) {
+      handleCommanderDeath(server, room, player.id, metadata.attackerId || null);
+    }
+
+    return { kind: 'player', target: player };
+  }
+
+  const building = (room.buildings || []).find((entry) => entry.id === targetId)
+    || (room.tunnels || []).find((entry) => entry.id === targetId);
+  if (building) {
+    building.hp = Math.max(0, (Number.isFinite(building.hp) ? building.hp : (building.type === 'tower' ? 5 : 10)) - Math.max(1, Math.floor(amount || 1)));
+    broadcastToRoom(server, room.id, {
+      type: 'remote_building_hit',
+      data: { buildingId: building.id, hp: building.hp }
+    });
+    if (building.hp <= 0) {
+      room.buildings = (room.buildings || []).filter((entry) => entry.id !== building.id);
+      room.tunnels = (room.tunnels || []).filter((entry) => entry.id !== building.id);
+      broadcastToRoom(server, room.id, {
+        type: 'OBJECT_DESTROYED',
+        data: { objectId: building.id, objectType: building.type || 'building' }
+      });
+      if (building.type === 'tunnel' || building.type === 'pit') {
+        broadcastToRoom(server, room.id, { type: 'remote_tunnel_remove', data: { id: building.id } });
+      } else {
+        broadcastToRoom(server, room.id, { type: 'remote_building_destroyed', data: building.id });
+      }
+    }
+    return { kind: 'object', target: building };
+  }
+
+  const npc = (room.npcGroups || []).find((entry) => entry.id === targetId);
+  if (npc) {
+    npc.unitCount = Math.max(0, Math.floor(npc.unitCount || 0) - Math.max(1, Math.floor(amount || 1)));
+    if (npc.unitCount <= 0) {
+      room.npcGroups = room.npcGroups.filter((entry) => entry.id !== npc.id);
+    }
+    return { kind: 'npc', target: npc };
+  }
+
+  return null;
+}
+
+function selectNpcTarget(room, npc) {
+  const aliveGates = (room.buildings || []).filter((entry) => (entry.type === 'GATE' || entry.type === 'gate') && entry.hp > 0);
+  if (aliveGates.length > 0) {
+    return aliveGates.sort((a, b) => getDistance(npc.x, npc.y, a.x, a.y) - getDistance(npc.x, npc.y, b.x, b.y))[0];
+  }
+
+  const aliveTowers = (room.buildings || []).filter((entry) => entry.type !== 'GATE' && entry.type !== 'gate' && entry.hp > 0);
+  if (aliveTowers.length > 0) {
+    return aliveTowers.sort((a, b) => getDistance(npc.x, npc.y, a.x, a.y) - getDistance(npc.x, npc.y, b.x, b.y))[0];
+  }
+
+  const alivePlayers = room.players.filter((entry) => entry.isAlive !== false);
+  if (alivePlayers.length > 0) {
+    return alivePlayers.sort((a, b) => getDistance(npc.x, npc.y, a.x, a.y) - getDistance(npc.x, npc.y, b.x, b.y))[0];
+  }
+
+  return null;
+}
+
+function applyPitDamageToActor(server, room, actor) {
+  if (!room || !actor || actor.isUnderground) return;
+  const now = Date.now();
+  const pits = [...(room.tunnels || []), ...(room.buildings || [])].filter((entry) => entry.type === 'pit' || entry.type === 'tunnel');
+  const insidePit = pits.find((pit) => getDistance(actor.x, actor.y, pit.x, pit.y) < 70);
+  if (!insidePit) return;
+
+  if (now - (actor.lastPitDamageAt || 0) < PIT_DAMAGE_COOLDOWN_MS) return;
+  actor.lastPitDamageAt = now;
+  applyDamage(server, room, actor.id, 1, { attackerId: insidePit.id, attackerName: 'Pit', source: 'pit' });
+}
+
+function updateRoomSimulation(server, room) {
+  if (!room || room.status !== 'active') return;
+  initRoomWorld(room);
+
+  room.players.forEach((player) => applyPitDamageToActor(server, room, player));
+
+  (room.npcGroups || []).forEach((npc) => {
+    if (npc.unitCount <= 0) return;
+    applyPitDamageToActor(server, room, npc);
+
+    const target = selectNpcTarget(room, npc);
+    npc.targetId = target ? target.id : null;
+    npc.isAttacking = false;
+    if (!target) return;
+
+    const targetPos = { x: target.x, y: target.y };
+    const angle = Math.atan2(targetPos.y - npc.y, targetPos.x - npc.x);
+    npc.rotation = angle;
+    const dist = getDistance(npc.x, npc.y, targetPos.x, targetPos.y);
+    if (dist > NPC_MELEE_RANGE) {
+      npc.x += Math.cos(angle) * NPC_MOVE_SPEED;
+      npc.y += Math.sin(angle) * NPC_MOVE_SPEED;
+    } else {
+      npc.isAttacking = true;
+      applyDamage(server, room, target.id, 1, {
+        attackerId: npc.id,
+        attackerName: npc.name,
+        source: 'npc'
+      });
     }
   });
 }
@@ -266,12 +496,16 @@ function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
     x: 600,
     y: 600,
     faction: isHost ? 'green' : 'blue',
+    rotation: 0,
     votedForRematch: false,
     hp: COMMANDER_MAX_HP,
     isAlive: true,
     isUnderground: initialIsUnderground,
     unitCount: 0,
-    empireId: null
+    empireId: null,
+    isAttacking: false,
+    isDashing: false,
+    akce: 0
   };
 
   room.players.push(player);
@@ -387,10 +621,15 @@ server.ws('/*', {
       if (player) {
         if (typeof syncData.x === 'number') player.x = syncData.x;
         if (typeof syncData.y === 'number') player.y = syncData.y;
+        if (typeof syncData.rotation === 'number') player.rotation = syncData.rotation;
         player.isUnderground = syncData.isUnderground ?? false;
         if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
         if (syncData.empireId) player.empireId = syncData.empireId;
         if (syncData.faction) player.faction = syncData.faction;
+        if (typeof syncData.isAttacking === 'boolean') player.isAttacking = syncData.isAttacking;
+        if (typeof syncData.isDashing === 'boolean') player.isDashing = syncData.isDashing;
+        if (typeof syncData.akce === 'number') player.akce = syncData.akce;
+        if (syncData.equippedItem) player.equippedItem = syncData.equippedItem;
       }
 
       broadcastPlayerState(server, room, player, syncData);
@@ -419,6 +658,7 @@ server.ws('/*', {
             players: [],
             buildings: [],
             tunnels: [],
+            npcGroups: [],
             maxPlayers: Number(data.limit) || 10,
             rematchVotes: 0,
             seed: Math.random()
@@ -540,7 +780,9 @@ server.ws('/*', {
           const room = rooms.get(roomId);
           if (room && room.hostId === ws.id) {
             room.status = 'active';
+            initRoomWorld(room);
             broadcastToRoom(server, roomId, { type: 'match_started', data: serializeRoom(room) });
+            sendWorldState(server, room);
             sendRoomList(server);
           }
           break;
@@ -619,64 +861,11 @@ server.ws('/*', {
               if (sourcePos && victim) {
                 const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
                 if (dist > maxDist) return;
-
-                const normalizedUnitCount = Number.isFinite(victim.unitCount) ? Math.max(0, Math.floor(victim.unitCount)) : 0;
-                const normalizedHp = Number.isFinite(victim.hp) ? victim.hp : COMMANDER_MAX_HP;
-
-                if (normalizedUnitCount > 0) {
-                  victim.unitCount -= 1;
-                  victim.hp = normalizedHp;
-
-                  data.currentHp = victim.hp;
-                  data.currentUnitCount = victim.unitCount;
-
-                  broadcastPlayerState(server, room, victim, {
-                    currentHp: victim.hp,
-                    currentUnitCount: victim.unitCount
-                  });
-
-                  const targetWs = socketsById.get(data.targetPlayerId);
-                  if (targetWs) {
-                    send(targetWs, 'take_unit_damage', {
-                      ...data,
-                      currentHp: victim.hp,
-                      currentUnitCount: victim.unitCount,
-                      serverMessage: `Тебя ударили, у тебя теперь ${victim.unitCount} воинов и ${victim.hp} здоровья`
-                    });
-                  }
-
-                  return;
-                }
-
-                victim.unitCount = 0;
-                victim.hp = Math.max(0, normalizedHp - COMMANDER_HIT_DAMAGE);
-
-                data.currentHp = victim.hp;
-                data.currentUnitCount = victim.unitCount;
-
-                broadcastToRoom(server, data.roomId, {
-                  type: 'remote_hp_sync',
-                  data: { id: victim.id, hp: victim.hp }
+                applyDamage(server, room, victim.id, 1, {
+                  attackerId: data.attackerId,
+                  attackerName: data.attackerName,
+                  source: 'unit_hit'
                 });
-
-                broadcastPlayerState(server, room, victim, {
-                  currentHp: victim.hp,
-                  currentUnitCount: victim.unitCount
-                });
-
-                const targetWs = socketsById.get(data.targetPlayerId);
-                if (targetWs) {
-                  send(targetWs, 'take_unit_damage', {
-                    ...data,
-                    currentHp: victim.hp,
-                    currentUnitCount: victim.unitCount,
-                    serverMessage: `Тебя ударили, у тебя теперь ${victim.unitCount} воинов и ${victim.hp} здоровья`
-                  });
-                }
-
-                if (victim.hp <= 0 && victim.isAlive !== false) {
-                  handleCommanderDeath(server, room, victim.id, data.attackerId);
-                }
               }
             }
           }
@@ -744,7 +933,11 @@ server.ws('/*', {
             if (room) {
               const attacker = room.players.find((player) => player.id === data.attackerId);
               if (attacker && attacker.isUnderground) return;
-              broadcastToRoom(server, data.roomId, { type: 'remote_building_hit', data });
+              applyDamage(server, room, data.buildingId, 1, {
+                attackerId: data.attackerId,
+                attackerName: data.attackerName,
+                source: 'building_hit'
+              });
             }
           }
           break;
@@ -811,10 +1004,12 @@ server.ws('/*', {
                 room.status = 'lobby';
                 room.buildings = [];
                 room.tunnels = [];
+                room.npcGroups = [];
                 room.players.forEach((entry) => {
                   entry.votedForRematch = false;
                   entry.hp = COMMANDER_MAX_HP;
                   entry.isAlive = true;
+                  entry.unitCount = 0;
                 });
                 broadcastToRoom(server, roomId, { type: 'rematch_started', data: serializeRoom(room) });
                 sendRoomList(server);
@@ -879,6 +1074,14 @@ setInterval(() => {
     });
   });
 }, TUNNEL_SWEEP_INTERVAL_MS);
+
+setInterval(() => {
+  rooms.forEach((room) => {
+    if (room.status !== 'active') return;
+    updateRoomSimulation(server, room);
+    sendWorldState(server, room);
+  });
+}, WORLD_STATE_INTERVAL_MS);
 
 server.listen('0.0.0.0', PORT, (token) => {
   if (token) {
