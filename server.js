@@ -291,12 +291,20 @@ server.ws('/*', {
       const room = rooms.get(roomId);
       if (!room) return;
 
-      if (!ws.roomId) {
+      if (ws.roomId && ws.roomId !== roomId) {
+        try {
+          ws.unsubscribe(ws.roomId);
+        } catch {}
+      }
+
+      if (ws.roomId !== roomId) {
         ws.subscribe(roomId);
         ws.roomId = roomId;
       }
 
       const player = room.players.find((entry) => entry.id === ws.id);
+      if (!player) return;
+
       if (player) {
         if (typeof syncData.x === 'number') player.x = syncData.x;
         if (typeof syncData.y === 'number') player.y = syncData.y;
