@@ -115,7 +115,7 @@ function upsertStructure(list, item) {
 
 function broadcastPlayerState(server, room, player, extraData = {}) {
   if (!room || !player) return;
-  const visibleUnitCount = Math.max(0, (Number.isFinite(player.unitCount) ? Math.floor(player.unitCount) : 1) - 1);
+  const visibleUnitCount = Math.max(0, Number.isFinite(player.unitCount) ? Math.floor(player.unitCount) : 0);
 
   broadcastToRoom(server, room.id, {
     type: 'remote_update',
@@ -270,7 +270,7 @@ function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
     hp: COMMANDER_MAX_HP,
     isAlive: true,
     isUnderground: initialIsUnderground,
-    unitCount: 1,
+    unitCount: 0,
     empireId: null
   };
 
@@ -388,7 +388,6 @@ server.ws('/*', {
         if (typeof syncData.x === 'number') player.x = syncData.x;
         if (typeof syncData.y === 'number') player.y = syncData.y;
         if (typeof syncData.hp === 'number') player.hp = syncData.hp;
-        if (typeof syncData.unitCount === 'number') player.unitCount = Math.max(1, Math.floor(syncData.unitCount) + 1);
         player.isUnderground = syncData.isUnderground ?? false;
         if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
         if (syncData.empireId) player.empireId = syncData.empireId;
@@ -479,20 +478,20 @@ server.ws('/*', {
 
           const strategy = data.strategy === 'SEPARATE_ALL' ? 'SEPARATE_ALL' : 'HALF';
           const mode = normalizeSplitMode(data.mode);
-          const currentUnitCount = Math.max(1, Math.floor(player.unitCount || 1));
+          const currentUnitCount = Math.max(0, Math.floor(player.unitCount || 0));
 
           if (strategy === 'SEPARATE_ALL') {
-            if (currentUnitCount <= 1) {
+            if (currentUnitCount <= 0) {
               send(ws, 'split_result', { success: false, strategy, mode });
               break;
             }
-          } else if (currentUnitCount < 15) {
+          } else if (currentUnitCount < 14) {
             send(ws, 'split_result', { success: false, strategy, mode });
             break;
           }
 
           const splitCount = strategy === 'SEPARATE_ALL'
-            ? Math.max(0, currentUnitCount - 1)
+            ? Math.max(0, currentUnitCount)
             : Math.floor(currentUnitCount / 2);
 
           if (splitCount <= 0) {
@@ -500,14 +499,14 @@ server.ws('/*', {
             break;
           }
 
-          player.unitCount = Math.max(1, currentUnitCount - splitCount);
+          player.unitCount = Math.max(0, currentUnitCount - splitCount);
 
           send(ws, 'split_result', {
             success: true,
             strategy,
             mode,
             splitCount,
-            remainingUnitCount: Math.max(0, player.unitCount - 1)
+            remainingUnitCount: player.unitCount
           });
 
           broadcastPlayerState(server, room, player, data);
@@ -606,19 +605,38 @@ server.ws('/*', {
                 const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
                 if (dist > maxDist) return;
 
-                const normalizedUnitCount = Number.isFinite(victim.unitCount) ? Math.max(1, Math.floor(victim.unitCount)) : 1;
+                const normalizedUnitCount = Number.isFinite(victim.unitCount) ? Math.max(0, Math.floor(victim.unitCount)) : 0;
                 const normalizedHp = Number.isFinite(victim.hp) ? victim.hp : COMMANDER_MAX_HP;
 
-                if (normalizedUnitCount > 1) {
-                  victim.unitCount = normalizedUnitCount - 1;
+                if (normalizedUnitCount > 0) {
+                  victim.unitCount -= 1;
                   victim.hp = normalizedHp;
-                } else {
-                  victim.unitCount = 1;
-                  victim.hp = Math.max(0, normalizedHp - COMMANDER_HIT_DAMAGE);
+
+                  data.currentHp = victim.hp;
+                  data.currentUnitCount = victim.unitCount;
+
+                  broadcastPlayerState(server, room, victim, {
+                    currentHp: victim.hp,
+                    currentUnitCount: victim.unitCount
+                  });
+
+                  const targetWs = socketsById.get(data.targetPlayerId);
+                  if (targetWs) {
+                    send(targetWs, 'take_unit_damage', {
+                      ...data,
+                      currentHp: victim.hp,
+                      currentUnitCount: victim.unitCount
+                    });
+                  }
+
+                  return;
                 }
 
+                victim.unitCount = 0;
+                victim.hp = Math.max(0, normalizedHp - COMMANDER_HIT_DAMAGE);
+
                 data.currentHp = victim.hp;
-                data.currentUnitCount = Math.max(0, victim.unitCount - 1);
+                data.currentUnitCount = victim.unitCount;
 
                 broadcastToRoom(server, data.roomId, {
                   type: 'remote_hp_sync',
@@ -635,7 +653,7 @@ server.ws('/*', {
                   send(targetWs, 'take_unit_damage', {
                     ...data,
                     currentHp: victim.hp,
-                    currentUnitCount: Math.max(0, victim.unitCount - 1)
+                    currentUnitCount: victim.unitCount
                   });
                 }
 
