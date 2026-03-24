@@ -7,6 +7,8 @@ const SYNC_PACKET_HEADER_SIZE = 25;
 const SYNC_PACKET_UNIT_COUNT_SENTINEL = 0xffffffff;
 const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
+const COMMANDER_MAX_HP = 500;
+const COMMANDER_HIT_DAMAGE = 50;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -264,7 +266,7 @@ function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
     y: 600,
     faction: isHost ? 'green' : 'blue',
     votedForRematch: false,
-    hp: 100,
+    hp: COMMANDER_MAX_HP,
     isAlive: true,
     isUnderground: initialIsUnderground,
     unitCount: 1,
@@ -603,17 +605,37 @@ server.ws('/*', {
                 const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
                 if (dist > maxDist) return;
 
-                victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
+                const normalizedUnitCount = Number.isFinite(victim.unitCount) ? Math.max(1, Math.floor(victim.unitCount)) : 1;
+                const normalizedHp = Number.isFinite(victim.hp) ? victim.hp : COMMANDER_MAX_HP;
+
+                if (normalizedUnitCount > 1) {
+                  victim.unitCount = normalizedUnitCount - 1;
+                  victim.hp = normalizedHp;
+                } else {
+                  victim.unitCount = 1;
+                  victim.hp = Math.max(0, normalizedHp - COMMANDER_HIT_DAMAGE);
+                }
+
                 data.currentHp = victim.hp;
+                data.currentUnitCount = victim.unitCount;
 
                 broadcastToRoom(server, data.roomId, {
                   type: 'remote_hp_sync',
                   data: { id: victim.id, hp: victim.hp }
                 });
 
+                broadcastPlayerState(server, room, victim, {
+                  currentHp: victim.hp,
+                  currentUnitCount: victim.unitCount
+                });
+
                 const targetWs = socketsById.get(data.targetPlayerId);
                 if (targetWs) {
-                  send(targetWs, 'take_unit_damage', data);
+                  send(targetWs, 'take_unit_damage', {
+                    ...data,
+                    currentHp: victim.hp,
+                    currentUnitCount: victim.unitCount
+                  });
                 }
 
                 if (victim.hp <= 0 && victim.isAlive !== false) {
