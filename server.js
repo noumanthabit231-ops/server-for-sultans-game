@@ -1,6 +1,6 @@
 const uWS = require('uWebSockets.js');
 
-const PORT = process.env.PORT || 3000; 
+const PORT = process.env.PORT || 3001; 
 
 // ГЛОБАЛЬНЫЕ ЛИМИТЫ 
 const MAX_GLOBAL_PLAYERS = 1000; 
@@ -10,23 +10,23 @@ const waitingQueue = [];
 // Хранилище комнат и игроков через Map() для мгновенного поиска
 const rooms = new Map(); 
 
+// Вспомогательная функция расчета дистанции
+function getDistance(x1, y1, x2, y2) {
+  return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
+}
+
 // Вспомогательная функция для распаковки бинарных данных (25 байт)
-function unpackSyncData(message) {
-  try {
-    const view = Buffer.from(message);
-    return {
-      shortId: view.readUInt32LE(0),
-      x: view.readFloatLE(4),
-      y: view.readFloatLE(8),
-      rotation: view.readFloatLE(12),
-      hp: view.readFloatLE(16),
-      unitCount: view.readUInt32LE(20),
-      isUnderground: view.readUInt8(24) === 1 // БИТ ПОДЗЕМЕЛЬЯ
-    };
-  } catch (e) {
-    console.error("Error unpacking sync data", e);
-    return { shortId: 0, x: 0, y: 0, rotation: 0, hp: 0, unitCount: 0, isUnderground: false };
-  }
+function unpackBinary(buffer) {
+  const view = new DataView(buffer);
+  return {
+    shortId: view.getUint32(0, true),
+    x: view.getFloat32(4, true),
+    y: view.getFloat32(8, true),
+    rotation: view.getFloat32(12, true),
+    hp: view.getFloat32(16, true),
+    unitCount: view.getUint32(20, true),
+    isUnderground: view.getUint8(24) === 1
+  };
 }
 
 // Вынос логики смерти в отдельную функцию для Authority
@@ -180,7 +180,7 @@ try {
           ws.publish(ws.roomId, message, true);
           const room = rooms.get(ws.roomId);
           if (room) {
-            const syncData = unpackSyncData(message);
+            const syncData = unpackBinary(message);
             const p = room.players.find(player => player.shortId === syncData.shortId);
             if (p) {
               p.x = syncData.x; p.y = syncData.y; p.hp = syncData.hp;
@@ -267,18 +267,23 @@ try {
               if (room) {
                 const attacker = room.players.find(p => p.id === data.attackerId);
                 const victim = room.players.find(p => p.id === data.targetPlayerId);
-                if (victim && victim.isUnderground) return;
-                if (attacker && attacker.isUnderground) return;
+                
+                // --- UNDERGROUND DAMAGE LOGIC (v2.9.5) ---
+                // Damage is allowed if BOTH are on the same layer.
+                // Blocked only if layers don't match.
+                if (attacker && victim) {
+                  if (attacker.isUnderground !== victim.isUnderground) return;
+                } else if (victim && victim.isUnderground) {
+                  // Towers or other non-player sources cannot hit underground victims
+                  return;
+                }
 
                 let sourcePos = null;
                 let maxDist = 350;
 
                 if (data.attackerId === 'tower') {
                    const towers = room.buildings.filter(b => b.ownerId === ws.id && b.type !== 'WALL' && b.type !== 'GATE');
-                   const nearestTower = towers.find(t => {
-                      const d = Math.sqrt((t.x - victim.x)**2 + (t.y - victim.y)**2);
-                      return d < 850;
-                   });
+                   const nearestTower = towers.find(t => getDistance(t.x, t.y, victim.x, victim.y) < 850);
                    if (nearestTower) {
                       sourcePos = { x: nearestTower.x, y: nearestTower.y };
                       maxDist = 850;
@@ -290,11 +295,19 @@ try {
                 }
 
                 if (sourcePos && victim) {
-                  const dist = Math.sqrt((sourcePos.x - victim.x)**2 + (sourcePos.y - victim.y)**2);
+                  const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
                   if (dist > maxDist) return console.log(`[COMBAT ARBITER] Hit blocked: distance ${Math.floor(dist)} > ${maxDist}`);
                   
                   victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
                   data.currentHp = victim.hp; 
+                  
+                  if (victim.hp >= 0) {
+                    broadcastToRoom(data.roomId, { 
+                      type: "remote_hp_sync", 
+                      data: { id: victim.id, hp: victim.hp } 
+                    });
+                  }
+
                   if (victim.hp <= 0 && victim.isAlive !== false) {
                      handleCommanderDeath(room, victim.id, data.attackerId);
                   }
