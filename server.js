@@ -9,6 +9,7 @@ const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 const COMMANDER_MAX_HP = 500;
 const COMMANDER_HIT_DAMAGE = 100;
+const HIT_RANGE_BUFFER_MULTIPLIER = 1.3;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -586,19 +587,19 @@ server.ws('/*', {
               if (!sameLayer) return;
 
               let sourcePos = null;
-              let maxDist = 350;
+              let maxDist = 350 * HIT_RANGE_BUFFER_MULTIPLIER;
 
               if (data.attackerId === 'tower') {
                 const towers = room.buildings.filter((building) => building.ownerId === ws.id && building.type !== 'WALL' && building.type !== 'GATE');
-                const nearestTower = towers.find((tower) => getDistance(tower.x, tower.y, victim.x, victim.y) < 850);
+                const nearestTower = towers.find((tower) => getDistance(tower.x, tower.y, victim.x, victim.y) < 850 * HIT_RANGE_BUFFER_MULTIPLIER);
                 if (nearestTower) {
                   sourcePos = { x: nearestTower.x, y: nearestTower.y };
-                  maxDist = 850;
+                  maxDist = 850 * HIT_RANGE_BUFFER_MULTIPLIER;
                 }
               } else if (attacker) {
                 sourcePos = { x: attacker.x, y: attacker.y };
                 const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
-                maxDist = armyRadius + 100;
+                maxDist = (armyRadius + 100) * HIT_RANGE_BUFFER_MULTIPLIER;
               }
 
               if (sourcePos && victim) {
