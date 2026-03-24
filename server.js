@@ -6,87 +6,81 @@ const MAX_GLOBAL_PLAYERS = 1000;
 const SYNC_PACKET_HEADER_SIZE = 25;
 const SYNC_PACKET_UNIT_COUNT_SENTINEL = 0xffffffff;
 
+const decoder = new TextDecoder();
+const rooms = new Map();
+const socketsById = new Map();
+const waitingQueue = [];
+
 let activeConnections = 0;
 
-const rooms = {};
-const clients = new Map();
-const waitingQueue = [];
-const decoder = new TextDecoder();
+function getDistance(x1, y1, x2, y2) {
+  return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
+}
 
-const makeId = () => Math.random().toString(36).slice(2, 12);
-const makeRoomId = () => Math.random().toString(36).slice(2, 7).toUpperCase();
+function serializeRoom(room) {
+  return {
+    id: room.id,
+    name: room.name,
+    password: room.password,
+    hostId: room.hostId,
+    status: room.status,
+    players: room.players,
+    buildings: room.buildings,
+    tunnels: room.tunnels || [],
+    maxPlayers: room.maxPlayers,
+    rematchVotes: room.rematchVotes,
+    seed: room.seed
+  };
+}
 
-const send = (ws, type, data) => {
-  try {
-    ws.send(JSON.stringify(data === undefined ? { type } : { type, data }));
-  } catch {}
-};
+function send(ws, type, data) {
+  ws.send(JSON.stringify(data === undefined ? { type } : { type, data }));
+}
 
-const serializeRoom = (room) => ({
-  id: room.id,
-  name: room.name,
-  password: room.password,
-  hostId: room.hostId,
-  status: room.status,
-  players: room.players,
-  buildings: room.buildings,
-  maxPlayers: room.maxPlayers,
-  rematchVotes: room.rematchVotes,
-  seed: room.seed,
-  tunnels: room.tunnels || []
-});
+function broadcast(server, message) {
+  server.publish('global', JSON.stringify(message));
+}
 
-const serializeRoomList = () =>
-  Object.values(rooms)
+function broadcastToRoom(server, roomId, message) {
+  server.publish(roomId, JSON.stringify(message));
+}
+
+function sendRoomList(server, targetWs = null) {
+  const list = Array.from(rooms.values())
     .filter((room) => room.status === 'lobby')
     .map((room) => {
-      const publicRoom = serializeRoom(room);
-      publicRoom.password = !!room.password;
-      return publicRoom;
+      const roomData = serializeRoom(room);
+      roomData.password = !!room.password;
+      return roomData;
     });
 
-const broadcastAll = (type, data) => {
-  for (const ws of clients.values()) {
-    send(ws, type, data);
-  }
-};
-
-const broadcastRoom = (roomId, type, data, excludeWs = null) => {
-  const room = rooms[roomId];
-  if (!room) return;
-
-  for (const peer of Array.from(room.connections)) {
-    if (peer !== excludeWs) {
-      send(peer, type, data);
-    }
-  }
-};
-
-const updateCapacity = () => {
-  broadcastAll('server_capacity', { active: activeConnections, max: MAX_GLOBAL_PLAYERS });
-};
-
-const sendRoomList = (targetWs = null) => {
-  const list = serializeRoomList();
   if (targetWs) {
     send(targetWs, 'room_list', list);
     return;
   }
-  broadcastAll('room_list', list);
-};
 
-const removeFromQueue = (ws) => {
+  broadcast(server, { type: 'room_list', data: list });
+}
+
+function updateServerCapacity(server) {
+  broadcast(server, {
+    type: 'server_capacity',
+    data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS }
+  });
+}
+
+function removeFromWaitingQueue(ws) {
   const idx = waitingQueue.indexOf(ws);
   if (idx !== -1) waitingQueue.splice(idx, 1);
-};
+}
 
-const refreshQueuePositions = () => {
+function refreshQueuePositions() {
   waitingQueue.forEach((queuedWs, index) => {
     send(queuedWs, 'queue_update', { position: index + 1 });
   });
-};
+}
 
-const approveNextQueuedClient = () => {
+function approveNextQueuedClient(server) {
   while (waitingQueue.length > 0 && activeConnections < MAX_GLOBAL_PLAYERS) {
     const nextWs = waitingQueue.shift();
     if (!nextWs || nextWs.closed) continue;
@@ -95,27 +89,54 @@ const approveNextQueuedClient = () => {
     activeConnections++;
     send(nextWs, 'queue_approved');
     send(nextWs, 'server_capacity', { active: activeConnections, max: MAX_GLOBAL_PLAYERS });
-    sendRoomList(nextWs);
+    sendRoomList(server, nextWs);
+    updateServerCapacity(server);
     refreshQueuePositions();
-    updateCapacity();
     return;
   }
 
+  updateServerCapacity(server);
   refreshQueuePositions();
-  updateCapacity();
-};
+}
 
-const handlePlayerLeaving = (ws, explicitRoomId = null) => {
-  const roomId = explicitRoomId || ws.roomId;
-  if (!roomId) return;
+function handleCommanderDeath(server, room, loserId, winnerId = null) {
+  if (!room || room.status !== 'active') return;
 
-  const room = rooms[roomId];
+  const loser = room.players.find((player) => player.id === loserId);
+  if (!loser || loser.isAlive === false) return;
+
+  loser.isAlive = false;
+  const winner = room.players.find((player) => player.id === winnerId);
+  const winnerName = winner ? winner.name : 'Enemy';
+
+  broadcastToRoom(server, room.id, {
+    type: 'player_eliminated',
+    data: { loserId, winnerId, winnerName }
+  });
+
+  const alivePlayers = room.players.filter((player) => player.isAlive !== false);
+  if (alivePlayers.length <= 1) {
+    room.status = 'finished';
+    const finalWinner = alivePlayers[0] || winner || null;
+    broadcastToRoom(server, room.id, {
+      type: 'game_over_final',
+      data: {
+        winnerId: finalWinner ? finalWinner.id : null,
+        winnerName: finalWinner ? finalWinner.name : 'Draw'
+      }
+    });
+  }
+}
+
+function handlePlayerLeaving(server, ws) {
+  if (!ws.roomId) return;
+
+  const roomId = ws.roomId;
+  const room = rooms.get(roomId);
   if (!room) {
-    if (ws.roomId === roomId) ws.roomId = null;
+    ws.roomId = null;
     return;
   }
-
-  room.connections.delete(ws);
 
   const playerIndex = room.players.findIndex((player) => player.id === ws.id);
   if (playerIndex !== -1) {
@@ -123,32 +144,41 @@ const handlePlayerLeaving = (ws, explicitRoomId = null) => {
   }
 
   if (room.hostId === ws.id && room.players.length > 0) {
-    room.hostId = room.players[0].id;
+    const nextHost = room.players[0];
+    room.hostId = nextHost.id;
     room.players.forEach((player) => {
       player.isHost = player.id === room.hostId;
     });
   }
 
   if (room.players.length === 0) {
-    delete rooms[roomId];
+    rooms.delete(roomId);
   } else {
-    broadcastRoom(roomId, 'room_update', serializeRoom(room));
+    broadcastToRoom(server, roomId, { type: 'room_update', data: serializeRoom(room) });
   }
 
-  if (ws.roomId === roomId) ws.roomId = null;
-};
+  try {
+    ws.unsubscribe(roomId);
+  } catch {}
 
-const joinRoomInternal = (ws, roomId, defaultName, isHost) => {
+  ws.roomId = null;
+}
+
+function joinRoomInternal(server, ws, roomId, defaultName, isHost) {
   if (ws.isQueued) return;
 
-  const room = rooms[roomId];
+  const room = rooms.get(roomId);
   if (!room) return;
 
-  const alreadyInRoom = room.players.some((player) => player.id === ws.id);
-  if (alreadyInRoom) return;
+  if (ws.roomId && ws.roomId !== roomId) {
+    handlePlayerLeaving(server, ws);
+  }
 
+  const existingPlayer = room.players.find((player) => player.id === ws.id);
+  if (existingPlayer) return;
+
+  ws.subscribe(roomId);
   ws.roomId = roomId;
-  room.connections.add(ws);
 
   const player = {
     id: ws.id,
@@ -160,118 +190,79 @@ const joinRoomInternal = (ws, roomId, defaultName, isHost) => {
     votedForRematch: false,
     hp: 100,
     isAlive: true,
-    empireId: null,
+    isUnderground: false,
     unitCount: 1,
-    isUnderground: false
+    empireId: null
   };
 
   room.players.push(player);
 
-  const roomData = serializeRoom(room);
-  send(ws, 'join_success', roomData);
-  broadcastRoom(roomId, 'room_update', roomData);
-  sendRoomList();
-};
+  send(ws, 'join_success', serializeRoom(room));
+  broadcastToRoom(server, roomId, { type: 'room_update', data: serializeRoom(room) });
+  sendRoomList(server);
+}
 
-const toArrayBuffer = (message) => {
-  if (message instanceof ArrayBuffer) return message;
+function decodeBinarySync(message) {
+  const arrayBuffer = Buffer.isBuffer(message)
+    ? message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength)
+    : message;
 
-  if (ArrayBuffer.isView(message)) {
-    return message.buffer.slice(message.byteOffset, message.byteOffset + message.byteLength);
+  if (!(arrayBuffer instanceof ArrayBuffer) || arrayBuffer.byteLength < SYNC_PACKET_HEADER_SIZE) {
+    return null;
   }
 
-  const buffer = Buffer.from(message);
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
-};
-
-const decodeSyncPacket = (message) => {
-  const buffer = toArrayBuffer(message);
-  if (buffer.byteLength < SYNC_PACKET_HEADER_SIZE) return null;
-
-  const view = new DataView(buffer);
-  const payload = {};
-
+  const view = new DataView(arrayBuffer);
   const x = view.getFloat32(0, true);
   const y = view.getFloat32(4, true);
   const rotation = view.getFloat32(8, true);
   const hp = view.getFloat32(12, true);
   const unitCount = view.getUint32(16, true);
-  const flags = view.getUint8(20);
-  const jsonLength = view.getUint32(21, true);
+  const isUnderground = view.getUint8(20) === 1;
+  const extraLength = view.getUint32(21, true);
 
-  if (jsonLength > 0 && buffer.byteLength >= SYNC_PACKET_HEADER_SIZE + jsonLength) {
-    const jsonBytes = new Uint8Array(buffer, SYNC_PACKET_HEADER_SIZE, jsonLength);
-    const jsonText = decoder.decode(jsonBytes);
-
-    if (jsonText) {
+  let extras = {};
+  if (extraLength > 0 && arrayBuffer.byteLength >= SYNC_PACKET_HEADER_SIZE + extraLength) {
+    const extraBytes = new Uint8Array(arrayBuffer, SYNC_PACKET_HEADER_SIZE, extraLength);
+    const extraText = decoder.decode(extraBytes);
+    if (extraText) {
       try {
-        Object.assign(payload, JSON.parse(jsonText));
-      } catch {}
+        extras = JSON.parse(extraText);
+      } catch {
+        extras = {};
+      }
     }
   }
 
-  if (Number.isFinite(x)) payload.x = x;
-  if (Number.isFinite(y)) payload.y = y;
-  if (Number.isFinite(rotation)) payload.rotation = rotation;
-  if (Number.isFinite(hp)) payload.hp = hp;
-  if (unitCount !== SYNC_PACKET_UNIT_COUNT_SENTINEL) payload.unitCount = unitCount;
-  if (payload.isUnderground === undefined) payload.isUnderground = Boolean(flags & 1);
-
-  return payload;
-};
-
-const applySyncData = (ws, payload) => {
-  const roomId = payload.roomId || ws.roomId;
-  if (!roomId || !rooms[roomId]) return;
-
-  const room = rooms[roomId];
-  ws.roomId = roomId;
-  room.connections.add(ws);
-
-  const player = room.players.find((entry) => entry.id === ws.id);
-  if (player) {
-    if (typeof payload.x === 'number') player.x = payload.x;
-    if (typeof payload.y === 'number') player.y = payload.y;
-    if (typeof payload.hp === 'number') player.hp = payload.hp;
-    if (typeof payload.unitCount === 'number') player.unitCount = payload.unitCount;
-    if (typeof payload.isUnderground === 'boolean') player.isUnderground = payload.isUnderground;
-    if (typeof payload.name === 'string' && payload.name.trim()) player.name = payload.name;
-    if (payload.empireId) player.empireId = payload.empireId;
-    if (payload.faction) player.faction = payload.faction;
-  }
-
-  const mergedPayload = {
-    id: ws.id,
-    roomId,
-    x: player?.x ?? payload.x ?? 0,
-    y: player?.y ?? payload.y ?? 0,
-    hp: player?.hp ?? payload.hp ?? 100,
-    unitCount: player?.unitCount ?? payload.unitCount ?? 1,
-    isUnderground: player?.isUnderground ?? payload.isUnderground ?? false,
-    ...payload
+  return {
+    ...extras,
+    x: Number.isFinite(x) ? x : undefined,
+    y: Number.isFinite(y) ? y : undefined,
+    rotation: Number.isFinite(rotation) ? rotation : undefined,
+    hp: Number.isFinite(hp) ? hp : undefined,
+    unitCount: unitCount === SYNC_PACKET_UNIT_COUNT_SENTINEL ? undefined : unitCount,
+    isUnderground
   };
+}
 
-  broadcastRoom(roomId, 'remote_update', mergedPayload, ws);
-};
+const server = uWS.App();
 
-const app = uWS.App();
-
-app.get('/', (res) => {
+server.get('/', (res) => {
   res.end(`--- SULTAN ENGINE v1.8.2 ONLINE | PLAYERS: ${activeConnections}/${MAX_GLOBAL_PLAYERS} ---`);
 });
 
-app.ws('/*', {
+server.ws('/*', {
   compression: uWS.SHARED_COMPRESSOR,
   maxPayloadLength: 16 * 1024 * 1024,
   idleTimeout: 60,
 
   open: (ws) => {
-    ws.id = makeId();
+    ws.id = Math.random().toString(36).substring(2, 15);
     ws.roomId = null;
     ws.isQueued = false;
     ws.closed = false;
 
-    clients.set(ws.id, ws);
+    socketsById.set(ws.id, ws);
+    ws.subscribe('global');
 
     send(ws, 'set_id', ws.id);
     send(ws, 'server_capacity', { active: activeConnections, max: MAX_GLOBAL_PLAYERS });
@@ -285,398 +276,383 @@ app.ws('/*', {
 
     activeConnections++;
     send(ws, 'queue_approved');
-    updateCapacity();
-    sendRoomList();
+    updateServerCapacity(server);
+    sendRoomList(server, ws);
   },
 
   message: (ws, message, isBinary) => {
     if (isBinary) {
-      const syncPayload = decodeSyncPacket(message);
-      if (syncPayload) {
-        applySyncData(ws, syncPayload);
+      const syncData = decodeBinarySync(message);
+      if (!syncData) return;
+
+      const roomId = syncData.roomId || ws.roomId;
+      if (!roomId) return;
+
+      const room = rooms.get(roomId);
+      if (!room) return;
+
+      if (!ws.roomId) {
+        ws.subscribe(roomId);
+        ws.roomId = roomId;
       }
+
+      const player = room.players.find((entry) => entry.id === ws.id);
+      if (player) {
+        if (typeof syncData.x === 'number') player.x = syncData.x;
+        if (typeof syncData.y === 'number') player.y = syncData.y;
+        if (typeof syncData.hp === 'number') player.hp = syncData.hp;
+        if (typeof syncData.unitCount === 'number') player.unitCount = syncData.unitCount;
+        if (typeof syncData.isUnderground === 'boolean') player.isUnderground = syncData.isUnderground;
+        if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
+        if (syncData.empireId) player.empireId = syncData.empireId;
+        if (syncData.faction) player.faction = syncData.faction;
+      }
+
+      broadcastToRoom(server, roomId, {
+        type: 'remote_update',
+        data: {
+          id: ws.id,
+          ...syncData
+        }
+      });
+
       return;
     }
 
-    let parsed;
     try {
-      parsed = JSON.parse(Buffer.from(message).toString());
-    } catch {
-      return;
-    }
+      const { type, data } = JSON.parse(Buffer.from(message).toString());
 
-    if (!parsed || typeof parsed.type !== 'string') return;
-
-    const type = parsed.type;
-    const data = parsed.data;
-
-    switch (type) {
-      case 'get_room_list': {
-        sendRoomList(ws);
-        break;
-      }
-
-      case 'create_room': {
-        if (ws.isQueued) break;
-
-        const roomId = makeRoomId();
-        rooms[roomId] = {
-          id: roomId,
-          name: data?.name || `Sultan_${roomId}`,
-          password: data?.password || '',
-          hostId: ws.id,
-          status: 'lobby',
-          players: [],
-          buildings: [],
-          tunnels: [],
-          connections: new Set(),
-          maxPlayers: Number(data?.limit) || 10,
-          rematchVotes: 0,
-          seed: Math.random()
-        };
-
-        joinRoomInternal(ws, roomId, data?.playerName || 'Great Agha', true);
-        break;
-      }
-
-      case 'join_room': {
-        if (ws.isQueued) break;
-
-        const roomId = typeof data === 'string' ? data : data?.roomId;
-        const password = typeof data === 'string' ? '' : data?.password || '';
-        const playerName =
-          typeof data === 'object' && data?.playerName
-            ? data.playerName
-            : `Janissary_${ws.id.slice(0, 3)}`;
-
-        const room = rooms[roomId];
-        if (!room) {
-          send(ws, 'error', 'Комната не найдена');
+      switch (type) {
+        case 'get_room_list': {
+          sendRoomList(server, ws);
           break;
         }
 
-        if (room.status !== 'lobby') {
-          send(ws, 'error', 'Битва уже идет!');
+        case 'create_room': {
+          if (ws.isQueued) return;
+          const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
+          const room = {
+            id: roomId,
+            name: data.name || `Sultan_${roomId}`,
+            password: data.password || '',
+            hostId: ws.id,
+            status: 'lobby',
+            players: [],
+            buildings: [],
+            tunnels: [],
+            maxPlayers: Number(data.limit) || 10,
+            rematchVotes: 0,
+            seed: Math.random()
+          };
+          rooms.set(roomId, room);
+          joinRoomInternal(server, ws, roomId, data.playerName || 'Great Agha', true);
           break;
         }
 
-        if (room.password && room.password !== password) {
-          send(ws, 'error', 'Неверный пароль!');
+        case 'join_room': {
+          if (ws.isQueued) return;
+          const roomId = typeof data === 'string' ? data : data.roomId;
+          const password = typeof data === 'string' ? '' : data.password;
+          const playerName = data.playerName || `Janissary_${ws.id.substring(0, 3)}`;
+          const room = rooms.get(roomId);
+          if (!room) return send(ws, 'error', 'Комната не найдена');
+          if (room.status !== 'lobby') return send(ws, 'error', 'Битва уже идет!');
+          if (room.password && room.password !== password) return send(ws, 'error', 'Неверный пароль!');
+          joinRoomInternal(server, ws, roomId, playerName, false);
           break;
         }
 
-        if (room.players.length >= room.maxPlayers) {
-          send(ws, 'error', 'Комната заполнена');
+        case 'leave_room': {
+          handlePlayerLeaving(server, ws);
+          sendRoomList(server);
           break;
         }
 
-        joinRoomInternal(ws, roomId, playerName, false);
-        break;
-      }
-
-      case 'leave_room': {
-        const roomId = typeof data === 'string' ? data : data?.roomId || ws.roomId;
-        handlePlayerLeaving(ws, roomId);
-        sendRoomList();
-        break;
-      }
-
-      case 'update_player_name': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const player = room.players.find((entry) => entry.id === ws.id);
-        if (!player) break;
-
-        if (typeof data?.name === 'string' && data.name.trim()) {
-          player.name = data.name;
-        }
-
-        if (data?.empireId) {
-          player.empireId = data.empireId;
-        }
-
-        broadcastRoom(roomId, 'room_update', serializeRoom(room));
-        break;
-      }
-
-      case 'sync_data': {
-        applySyncData(ws, data || {});
-        break;
-      }
-
-      case 'remote_hp_sync': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const player = room.players.find((entry) => entry.id === (data?.id || ws.id));
-        if (player && typeof data?.hp === 'number') {
-          player.hp = data.hp;
-        }
-
-        broadcastRoom(
-          roomId,
-          'remote_hp_sync',
-          { id: data?.id || ws.id, hp: typeof data?.hp === 'number' ? data.hp : player?.hp ?? 100 },
-          ws
-        );
-        break;
-      }
-
-      case 'start_match_request': {
-        const roomId = typeof data === 'string' ? data : data?.roomId;
-        const room = rooms[roomId];
-        if (!room || room.hostId !== ws.id) break;
-
-        room.status = 'active';
-        broadcastRoom(roomId, 'match_started', serializeRoom(room));
-        sendRoomList();
-        break;
-      }
-
-      case 'start_countdown': {
-        const roomId = typeof data === 'string' ? data : data?.roomId;
-        const seconds = Number(data?.seconds) || 5;
-        if (roomId) {
-          broadcastRoom(roomId, 'start_countdown', seconds);
-        }
-        break;
-      }
-
-      case 'commander_death_detected': {
-        const room = rooms[data?.roomId];
-        if (!room || room.status !== 'active') break;
-
-        const loser = room.players.find((player) => player.id === data.loserId);
-        if (loser) loser.isAlive = false;
-
-        const winner = room.players.find((player) => player.id === data.winnerId);
-        const winnerName = winner ? winner.name : 'Enemy';
-
-        broadcastRoom(data.roomId, 'player_eliminated', {
-          loserId: data.loserId,
-          winnerId: data.winnerId,
-          winnerName
-        });
-
-        const alivePlayers = room.players.filter((player) => player.isAlive !== false);
-        if (alivePlayers.length <= 1) {
-          room.status = 'finished';
-          const finalWinner = alivePlayers[0] || winner || null;
-
-          broadcastRoom(data.roomId, 'game_over_final', {
-            winnerId: finalWinner ? finalWinner.id : null,
-            winnerName: finalWinner ? finalWinner.name : 'Draw'
-          });
-        }
-        break;
-      }
-
-      case 'vote_rematch': {
-        const roomId = typeof data === 'string' ? data : data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const player = room.players.find((entry) => entry.id === ws.id);
-        if (!player || player.votedForRematch) break;
-
-        player.votedForRematch = true;
-        room.rematchVotes = (room.rematchVotes || 0) + 1;
-
-        broadcastRoom(roomId, 'update_rematch_votes', {
-          votedPlayers: room.rematchVotes,
-          maxPlayers: room.players.length
-        });
-
-        if (room.rematchVotes >= room.players.length) {
-          room.rematchVotes = 0;
-          room.status = 'lobby';
-          room.buildings = [];
-          room.tunnels = [];
-
-          room.players.forEach((entry) => {
-            entry.votedForRematch = false;
-            entry.hp = 100;
-            entry.isAlive = true;
-          });
-
-          broadcastRoom(roomId, 'rematch_started', serializeRoom(room));
-          sendRoomList();
-        }
-        break;
-      }
-
-      case 'request_tunnels': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        send(ws, 'sync_tunnels', { tunnels: room.tunnels || [] });
-        break;
-      }
-
-      case 'tunnel_update': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const tunnel = { ...data, ownerId: ws.id };
-        const idx = room.tunnels.findIndex((entry) => entry.id === tunnel.id);
-
-        if (idx !== -1) room.tunnels[idx] = tunnel;
-        else room.tunnels.push(tunnel);
-
-        broadcastRoom(roomId, 'remote_tunnel_update', tunnel, ws);
-        break;
-      }
-
-      case 'tunnel_remove': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        room.tunnels = room.tunnels.filter((entry) => entry.id !== data.id);
-        broadcastRoom(roomId, 'remote_tunnel_remove', { id: data.id }, ws);
-        break;
-      }
-
-      case 'building_placed': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        if (data?.type === 'tunnel' || data?.type === 'pit') {
-          const tunnel = { ...data, ownerId: ws.id };
-          room.tunnels.push(tunnel);
-          broadcastRoom(roomId, 'remote_tunnel_update', tunnel, ws);
+        case 'update_player_name': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            const player = room.players.find((entry) => entry.id === ws.id);
+            if (player) {
+              player.name = data.name;
+              player.empireId = data.empireId;
+              broadcastToRoom(server, data.roomId, { type: 'room_update', data: serializeRoom(room) });
+            }
+          }
           break;
         }
 
-        const building = { ...data, ownerId: ws.id, isOpen: false };
-        room.buildings.push(building);
-        broadcastRoom(roomId, 'remote_building_placed', building);
-        break;
-      }
-
-      case 'building_hit': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'remote_building_hit', data, ws);
-        }
-        break;
-      }
-
-      case 'building_destroyed': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const beforeBuildings = room.buildings.length;
-        room.buildings = room.buildings.filter((entry) => entry.id !== data.buildingId);
-
-        if (room.buildings.length !== beforeBuildings) {
-          broadcastRoom(roomId, 'remote_building_destroyed', data.buildingId);
+        case 'request_tunnels': {
+          const room = rooms.get(data.roomId);
+          if (room && room.tunnels) {
+            send(ws, 'sync_tunnels', { tunnels: room.tunnels });
+          }
           break;
         }
 
-        const beforeTunnels = room.tunnels.length;
-        room.tunnels = room.tunnels.filter((entry) => entry.id !== data.buildingId);
-
-        if (room.tunnels.length !== beforeTunnels) {
-          broadcastRoom(roomId, 'remote_tunnel_remove', { id: data.buildingId });
+        case 'start_match_request': {
+          const roomId = typeof data === 'string' ? data : data.roomId;
+          const room = rooms.get(roomId);
+          if (room && room.hostId === ws.id) {
+            room.status = 'active';
+            broadcastToRoom(server, roomId, { type: 'match_started', data: serializeRoom(room) });
+            sendRoomList(server);
+          }
+          break;
         }
-        break;
-      }
 
-      case 'garrison_hit': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'remote_garrison_hit', data);
+        case 'start_countdown': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'start_countdown', data: 5 });
+          }
+          break;
         }
-        break;
-      }
 
-      case 'garrison_destroyed': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'garrison_destroyed', data);
+        case 'host_sync_world': {
+          if (data.roomId) {
+            const room = rooms.get(data.roomId);
+            if (room && room.hostId === ws.id) {
+              broadcastToRoom(server, data.roomId, {
+                type: 'sync_world',
+                data: {
+                  neutrals: data.neutrals || [],
+                  towers: data.towers || []
+                }
+              });
+            }
+          }
+          break;
         }
-        break;
-      }
 
-      case 'toggle_gate': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room) break;
-
-        const gate = room.buildings.find((entry) => entry.id === data.buildingId);
-        if (!gate) break;
-
-        gate.isOpen = data.isOpen;
-        broadcastRoom(roomId, 'remote_gate_toggled', data);
-        break;
-      }
-
-      case 'unit_hit': {
-        const targetWs = clients.get(data?.targetPlayerId);
-        if (targetWs) {
-          send(targetWs, 'take_unit_damage', data);
+        case 'commander_death_detected': {
+          const room = rooms.get(data.roomId);
+          if (room) handleCommanderDeath(server, room, data.loserId, data.winnerId);
+          break;
         }
-        break;
-      }
 
-      case 'tower_fire': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'remote_tower_fire', data, ws);
+        case 'remote_hp_sync': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            const victim = room.players.find((player) => player.id === data.id);
+            if (victim) victim.hp = data.hp;
+            broadcastToRoom(server, data.roomId, {
+              type: 'remote_hp_sync',
+              data: { id: data.id, hp: data.hp }
+            });
+          }
+          break;
         }
-        break;
-      }
 
-      case 'attack': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'attack_event', { id: ws.id }, ws);
+        case 'unit_hit': {
+          if (data.roomId) {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              const attacker = room.players.find((player) => player.id === data.attackerId);
+              const victim = room.players.find((player) => player.id === data.targetPlayerId);
+
+              const sameLayer = attacker && victim
+                ? attacker.isUnderground === victim.isUnderground
+                : !(victim && victim.isUnderground);
+              if (!sameLayer) return;
+
+              let sourcePos = null;
+              let maxDist = 350;
+
+              if (data.attackerId === 'tower') {
+                const towers = room.buildings.filter((building) => building.ownerId === ws.id && building.type !== 'WALL' && building.type !== 'GATE');
+                const nearestTower = towers.find((tower) => getDistance(tower.x, tower.y, victim.x, victim.y) < 850);
+                if (nearestTower) {
+                  sourcePos = { x: nearestTower.x, y: nearestTower.y };
+                  maxDist = 850;
+                }
+              } else if (attacker) {
+                sourcePos = { x: attacker.x, y: attacker.y };
+                const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
+                maxDist = armyRadius + 100;
+              }
+
+              if (sourcePos && victim) {
+                const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
+                if (dist > maxDist) return;
+
+                victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
+                data.currentHp = victim.hp;
+
+                broadcastToRoom(server, data.roomId, {
+                  type: 'remote_hp_sync',
+                  data: { id: victim.id, hp: victim.hp }
+                });
+
+                const targetWs = socketsById.get(data.targetPlayerId);
+                if (targetWs) {
+                  send(targetWs, 'take_unit_damage', data);
+                }
+
+                if (victim.hp <= 0 && victim.isAlive !== false) {
+                  handleCommanderDeath(server, room, victim.id, data.attackerId);
+                }
+              }
+            }
+          }
+          break;
         }
-        break;
-      }
 
-      case 'host_sync_world': {
-        const roomId = data?.roomId || ws.roomId;
-        const room = rooms[roomId];
-        if (!room || room.hostId !== ws.id) break;
-
-        broadcastRoom(roomId, 'sync_world', {
-          neutrals: data.neutrals || [],
-          towers: data.towers || []
-        }, ws);
-        break;
-      }
-
-      case 'village_spawned': {
-        const roomId = data?.roomId || ws.roomId;
-        if (roomId) {
-          broadcastRoom(roomId, 'village_spawned', data, ws);
+        case 'tower_fire': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'remote_tower_fire', data });
+          }
+          break;
         }
-        break;
-      }
 
-      case 'heartbeat':
-      case 'garrison_update':
-      default: {
-        break;
+        case 'attack': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'attack_event', data: { id: ws.id } });
+          }
+          break;
+        }
+
+        case 'tunnel_update': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            if (!room.tunnels) room.tunnels = [];
+            const newTunnel = { ...data, ownerId: ws.id };
+            const idx = room.tunnels.findIndex((tunnel) => tunnel.id === data.id);
+            if (idx !== -1) room.tunnels[idx] = newTunnel;
+            else room.tunnels.push(newTunnel);
+            broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_update', data: newTunnel });
+          }
+          break;
+        }
+
+        case 'tunnel_remove': {
+          const room = rooms.get(data.roomId);
+          if (room && room.tunnels) {
+            room.tunnels = room.tunnels.filter((tunnel) => tunnel.id !== data.id);
+            broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_remove', data: { id: data.id } });
+          }
+          break;
+        }
+
+        case 'building_placed': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            if (data.type === 'tunnel' || data.type === 'pit') {
+              if (!room.tunnels) room.tunnels = [];
+              const newTunnel = { ...data, ownerId: ws.id };
+              room.tunnels.push(newTunnel);
+              broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_update', data: newTunnel });
+            } else {
+              const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
+              room.buildings.push(newBuilding);
+              broadcastToRoom(server, data.roomId, { type: 'remote_building_placed', data: newBuilding });
+            }
+          }
+          break;
+        }
+
+        case 'building_hit': {
+          if (data.roomId) {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              const attacker = room.players.find((player) => player.id === data.attackerId);
+              if (attacker && attacker.isUnderground) return;
+              broadcastToRoom(server, data.roomId, { type: 'remote_building_hit', data });
+            }
+          }
+          break;
+        }
+
+        case 'building_destroyed': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            const initialLen = room.buildings.length;
+            room.buildings = room.buildings.filter((building) => building.id !== data.buildingId);
+            if (room.buildings.length < initialLen) {
+              broadcastToRoom(server, data.roomId, { type: 'remote_building_destroyed', data: data.buildingId });
+            } else if (room.tunnels) {
+              const tunnelLen = room.tunnels.length;
+              room.tunnels = room.tunnels.filter((tunnel) => tunnel.id !== data.buildingId);
+              if (room.tunnels.length < tunnelLen) {
+                broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_remove', data: { id: data.buildingId } });
+              }
+            }
+          }
+          break;
+        }
+
+        case 'toggle_gate': {
+          const room = rooms.get(data.roomId);
+          if (room) {
+            const gate = room.buildings.find((building) => building.id === data.buildingId);
+            if (gate) {
+              gate.isOpen = data.isOpen;
+              broadcastToRoom(server, data.roomId, { type: 'remote_gate_toggled', data });
+            }
+          }
+          break;
+        }
+
+        case 'garrison_hit': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'remote_garrison_hit', data });
+          }
+          break;
+        }
+
+        case 'garrison_destroyed': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'garrison_destroyed', data });
+          }
+          break;
+        }
+
+        case 'vote_rematch': {
+          const roomId = typeof data === 'string' ? data : data.roomId;
+          const room = rooms.get(roomId);
+          if (room) {
+            const player = room.players.find((entry) => entry.id === ws.id);
+            if (player && !player.votedForRematch) {
+              player.votedForRematch = true;
+              room.rematchVotes = (room.rematchVotes || 0) + 1;
+              broadcastToRoom(server, roomId, {
+                type: 'update_rematch_votes',
+                data: { votedPlayers: room.rematchVotes, maxPlayers: room.players.length }
+              });
+              if (room.rematchVotes >= room.players.length) {
+                room.rematchVotes = 0;
+                room.status = 'lobby';
+                room.buildings = [];
+                room.tunnels = [];
+                room.players.forEach((entry) => {
+                  entry.votedForRematch = false;
+                  entry.hp = 100;
+                  entry.isAlive = true;
+                });
+                broadcastToRoom(server, roomId, { type: 'rematch_started', data: serializeRoom(room) });
+                sendRoomList(server);
+              }
+            }
+          }
+          break;
+        }
+
+        case 'village_spawned': {
+          if (data.roomId) {
+            broadcastToRoom(server, data.roomId, { type: 'village_spawned', data });
+          }
+          break;
+        }
       }
+    } catch (error) {
+      console.error('JSON Parse error', error);
     }
   },
 
   close: (ws) => {
     ws.closed = true;
-    clients.delete(ws.id);
+    socketsById.delete(ws.id);
 
     if (ws.isQueued) {
-      removeFromQueue(ws);
+      removeFromWaitingQueue(ws);
       refreshQueuePositions();
       return;
     }
@@ -685,15 +661,15 @@ app.ws('/*', {
       activeConnections--;
     }
 
-    handlePlayerLeaving(ws);
-    sendRoomList();
-    approveNextQueuedClient();
+    handlePlayerLeaving(server, ws);
+    sendRoomList(server);
+    approveNextQueuedClient(server);
   }
 });
 
-app.listen('0.0.0.0', PORT, (token) => {
+server.listen('0.0.0.0', PORT, (token) => {
   if (token) {
-    console.log(`--- SULTAN ENGINE uWS ONLINE: ${PORT} ---`);
+    console.log(`--- SERVER IS LIVE ON PORT ${PORT} ---`);
   } else {
     console.log(`Failed to listen on port ${PORT}`);
   }
