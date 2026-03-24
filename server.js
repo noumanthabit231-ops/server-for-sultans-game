@@ -8,7 +8,7 @@ const SYNC_PACKET_UNIT_COUNT_SENTINEL = 0xffffffff;
 const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 const COMMANDER_MAX_HP = 500;
-const COMMANDER_HIT_DAMAGE = 50;
+const COMMANDER_HIT_DAMAGE = 100;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -115,6 +115,7 @@ function upsertStructure(list, item) {
 
 function broadcastPlayerState(server, room, player, extraData = {}) {
   if (!room || !player) return;
+  const visibleUnitCount = Math.max(0, (Number.isFinite(player.unitCount) ? Math.floor(player.unitCount) : 1) - 1);
 
   broadcastToRoom(server, room.id, {
     type: 'remote_update',
@@ -125,7 +126,7 @@ function broadcastPlayerState(server, room, player, extraData = {}) {
       x: player.x,
       y: player.y,
       hp: player.hp,
-      unitCount: player.unitCount,
+      unitCount: visibleUnitCount,
       isUnderground: player.isUnderground,
       faction: player.faction,
       empireId: player.empireId,
@@ -387,7 +388,7 @@ server.ws('/*', {
         if (typeof syncData.x === 'number') player.x = syncData.x;
         if (typeof syncData.y === 'number') player.y = syncData.y;
         if (typeof syncData.hp === 'number') player.hp = syncData.hp;
-        if (typeof syncData.unitCount === 'number') player.unitCount = syncData.unitCount;
+        if (typeof syncData.unitCount === 'number') player.unitCount = Math.max(1, Math.floor(syncData.unitCount) + 1);
         player.isUnderground = syncData.isUnderground ?? false;
         if (typeof syncData.name === 'string' && syncData.name.trim()) player.name = syncData.name;
         if (syncData.empireId) player.empireId = syncData.empireId;
@@ -506,7 +507,7 @@ server.ws('/*', {
             strategy,
             mode,
             splitCount,
-            remainingUnitCount: player.unitCount
+            remainingUnitCount: Math.max(0, player.unitCount - 1)
           });
 
           broadcastPlayerState(server, room, player, data);
@@ -617,7 +618,7 @@ server.ws('/*', {
                 }
 
                 data.currentHp = victim.hp;
-                data.currentUnitCount = victim.unitCount;
+                data.currentUnitCount = Math.max(0, victim.unitCount - 1);
 
                 broadcastToRoom(server, data.roomId, {
                   type: 'remote_hp_sync',
@@ -634,7 +635,7 @@ server.ws('/*', {
                   send(targetWs, 'take_unit_damage', {
                     ...data,
                     currentHp: victim.hp,
-                    currentUnitCount: victim.unitCount
+                    currentUnitCount: Math.max(0, victim.unitCount - 1)
                   });
                 }
 
@@ -777,7 +778,7 @@ server.ws('/*', {
                 room.tunnels = [];
                 room.players.forEach((entry) => {
                   entry.votedForRematch = false;
-                  entry.hp = 100;
+                  entry.hp = COMMANDER_MAX_HP;
                   entry.isAlive = true;
                 });
                 broadcastToRoom(server, roomId, { type: 'rematch_started', data: serializeRoom(room) });
