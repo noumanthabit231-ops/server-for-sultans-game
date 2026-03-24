@@ -9,7 +9,7 @@ const TUNNEL_LIFETIME_MS = 20000;
 const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 const COMMANDER_MAX_HP = 500;
 const COMMANDER_HIT_DAMAGE = 100;
-const HIT_RANGE_BUFFER_MULTIPLIER = 1.3;
+const HIT_RANGE_BUFFER_MULTIPLIER = 1.2;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
