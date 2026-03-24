@@ -17,17 +17,22 @@ const rooms = new Map();
 
 // Вспомогательная функция для распаковки бинарных данных (25 байт)
 function unpackSyncData(message) {
-  // message в uWS — это ArrayBuffer
-  const view = new DataView(message);
-  return {
-    shortId: view.getUint32(0, true),
-    x: view.getFloat32(4, true),
-    y: view.getFloat32(8, true),
-    rotation: view.getFloat32(12, true),
-    hp: view.getFloat32(16, true),
-    unitCount: view.getUint32(20, true),
-    isUnderground: view.getUint8(24) === 1 // БИТ ПОДЗЕМЕЛЬЯ
-  };
+  // message в uWS — это ArrayBuffer, в Node.js работаем через Buffer
+  try {
+    const view = Buffer.from(message);
+    return {
+      shortId: view.readUInt32LE(0),
+      x: view.readFloatLE(4),
+      y: view.readFloatLE(8),
+      rotation: view.readFloatLE(12),
+      hp: view.readFloatLE(16),
+      unitCount: view.readUInt32LE(20),
+      isUnderground: view.readUInt8(24) === 1 // БИТ ПОДЗЕМЕЛЬЯ
+    };
+  } catch (e) {
+    console.error("Error unpacking sync data", e);
+    return { shortId: 0, x: 0, y: 0, rotation: 0, hp: 0, unitCount: 0, isUnderground: false };
+  }
 }
 
 // Вынос логики смерти в отдельную функцию для Authority
@@ -121,387 +126,392 @@ function sendRoomList(ws = null) {
   }
 } 
 
-const server = uWS.App().ws('/*', {
-  compression: uWS.SHARED_COMPRESSOR,
-  maxPayloadLength: 16 * 1024 * 1024,
-  idleTimeout: 60,
+try {
+  uWS.App().ws('/*', {
+    compression: uWS.SHARED_COMPRESSOR,
+    maxPayloadLength: 16 * 1024 * 1024,
+    idleTimeout: 60,
 
-  open: (ws) => {
-    ws.id = Math.random().toString(36).substring(2, 15);
-    ws.subscribe('global');
-    
-    // Передаем ID клиенту
-    ws.send(JSON.stringify({ type: 'set_id', data: ws.id }));
-    
-    ws.send(JSON.stringify({ 
-      type: "server_capacity", 
-      data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } 
-    }));
-
-    if (activeConnections >= MAX_GLOBAL_PLAYERS) { 
-      waitingQueue.push(ws); 
-      ws.isQueued = true; 
-      ws.send(JSON.stringify({ type: "queue_update", data: { position: waitingQueue.length } })); 
-    } else { 
-      activeConnections++; 
-      ws.isQueued = false; 
-      ws.send(JSON.stringify({ type: "queue_approved" })); 
-      broadcast({ type: "server_capacity", data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } }); 
-      sendRoomList(ws); 
-    }
-  },
-
-  message: (ws, message, isBinary) => {
-    // ВЫСОКОЧАСТОТНЫЕ ДАННЫЕ (БИНАРНЫЕ)
-    if (isBinary) {
-      if (ws.roomId) {
-        // TOTAL BINARY BROADCAST: Мгновенная пересылка байтов всем в комнате (uWS mode)
-        ws.publish(ws.roomId, message, true);
-
-        // РАСПАКОВКА И ОБНОВЛЕНИЕ ПАМЯТИ СЕРВЕРА (Арбитраж)
-        const room = rooms.get(ws.roomId);
-        if (room) {
-          const syncData = unpackSyncData(message);
-          const p = room.players.find(player => player.shortId === syncData.shortId);
-          if (p) {
-            p.x = syncData.x;
-            p.y = syncData.y;
-            p.hp = syncData.hp;
-            p.unitCount = syncData.unitCount;
-            p.isUnderground = syncData.isUnderground; // ОБНОВЛЯЕМ СОСТОЯНИЕ В ПАМЯТИ
-
-            // SERVER AUTHORITY: Смерть при достижении 0 юнитов
-            if (p.unitCount === 0 && p.isAlive !== false && room.status === 'active') {
-               handleCommanderDeath(room, p.id);
-            }
-          }
-        }
-      }
-      return;
-    }
-
-    // РЕДКИЕ СОБЫТИЯ (JSON)
-    try {
-      const { type, data } = JSON.parse(Buffer.from(message).toString());
+    open: (ws) => {
+      ws.id = Math.random().toString(36).substring(2, 15);
+      ws.subscribe('global');
       
-      switch (type) {
-        case 'create_room': {
-          if (ws.isQueued) return;
-          const roomId = Math.random().toString(36).substring(2, 7).toUpperCase(); 
-          const room = { 
-            id: roomId, 
-            name: data.name || `Sultan_${roomId}`, 
-            password: data.password || '', 
-            hostId: ws.id, 
-            status: 'lobby', 
-            players: [], 
-            buildings: [], 
-            tunnels: [], 
-            maxPlayers: Number(data.limit) || 10, 
-            rematchVotes: 0, 
-            seed: Math.random() 
-          };
-          rooms.set(roomId, room);
-          joinRoomInternal(ws, roomId, data.playerName || "Great Agha", true);
-          break;
-        }
+      // Передаем ID клиенту
+      ws.send(JSON.stringify({ type: 'set_id', data: ws.id }));
+      
+      ws.send(JSON.stringify({ 
+        type: "server_capacity", 
+        data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } 
+      }));
 
-        case 'join_room': {
-          if (ws.isQueued) return;
-          const roomId = typeof data === 'string' ? data : data.roomId; 
-          const password = typeof data === 'string' ? '' : data.password; 
-          const playerName = data.playerName || `Janissary_${ws.id.substring(0, 3)}`; 
+      if (activeConnections >= MAX_GLOBAL_PLAYERS) { 
+        waitingQueue.push(ws); 
+        ws.isQueued = true; 
+        ws.send(JSON.stringify({ type: "queue_update", data: { position: waitingQueue.length } })); 
+      } else { 
+        activeConnections++; 
+        ws.isQueued = false; 
+        ws.send(JSON.stringify({ type: "queue_approved" })); 
+        broadcast({ type: "server_capacity", data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } }); 
+        sendRoomList(ws); 
+      }
+    },
 
-          const room = rooms.get(roomId); 
-          if (!room) return ws.send(JSON.stringify({ type: "error", data: "Комната не найдена" })); 
-          if (room.status !== 'lobby') return ws.send(JSON.stringify({ type: "error", data: "Битва уже идет!" })); 
-          if (room.password && room.password !== password) return ws.send(JSON.stringify({ type: "error", data: "Неверный пароль!" })); 
+    message: (ws, message, isBinary) => {
+      // ВЫСОКОЧАСТОТНЫЕ ДАННЫЕ (БИНАРНЫЕ)
+      if (isBinary) {
+        if (ws.roomId) {
+          // TOTAL BINARY BROADCAST: Мгновенная пересылка байтов всем в комнате (uWS mode)
+          ws.publish(ws.roomId, message, true);
 
-          joinRoomInternal(ws, roomId, playerName, false); 
-          break;
-        }
-
-        case 'leave_room': {
-          handlePlayerLeaving(ws);
-          if (ws.roomId) ws.unsubscribe(ws.roomId);
-          ws.roomId = null;
-          sendRoomList();
-          break;
-        }
-
-        case 'update_player_name': {
-          const room = rooms.get(data.roomId);
+          // РАСПАКОВКА И ОБНОВЛЕНИЕ ПАМЯТИ СЕРВЕРА (Арбитраж)
+          const room = rooms.get(ws.roomId);
           if (room) {
-            const p = room.players.find(player => player.id === ws.id);
+            const syncData = unpackSyncData(message);
+            const p = room.players.find(player => player.shortId === syncData.shortId);
             if (p) {
-              p.name = data.name;
-              p.empireId = data.empireId;
-              broadcastToRoom(data.roomId, { type: "room_update", data: room });
+              p.x = syncData.x;
+              p.y = syncData.y;
+              p.hp = syncData.hp;
+              p.unitCount = syncData.unitCount;
+              p.isUnderground = syncData.isUnderground; // ОБНОВЛЯЕМ СОСТОЯНИЕ В ПАМЯТИ
+
+              // SERVER AUTHORITY: Смерть при достижении 0 юнитов
+              if (p.unitCount === 0 && p.isAlive !== false && room.status === 'active') {
+                 handleCommanderDeath(room, p.id);
+              }
             }
           }
-          break;
         }
+        return;
+      }
 
-        case 'start_match_request': {
-          const room = rooms.get(data);
-          if (room && room.hostId === ws.id) {
-            room.status = 'active';
-            broadcastToRoom(data, { type: "match_started", data: room });
-            sendRoomList();
+      // РЕДКИЕ СОБЫТИЯ (JSON)
+      try {
+        const { type, data } = JSON.parse(Buffer.from(message).toString());
+        
+        switch (type) {
+          case 'create_room': {
+            if (ws.isQueued) return;
+            const roomId = Math.random().toString(36).substring(2, 7).toUpperCase(); 
+            const room = { 
+              id: roomId, 
+              name: data.name || `Sultan_${roomId}`, 
+              password: data.password || '', 
+              hostId: ws.id, 
+              status: 'lobby', 
+              players: [], 
+              buildings: [], 
+              tunnels: [], 
+              maxPlayers: Number(data.limit) || 10, 
+              rematchVotes: 0, 
+              seed: Math.random() 
+            };
+            rooms.set(roomId, room);
+            joinRoomInternal(ws, roomId, data.playerName || "Great Agha", true);
+            break;
           }
-          break;
-        }
 
-        // --- БОЕВКА И СМЕРТИ (Арбитраж) ---
-        case 'commander_death_detected': {
-          const room = rooms.get(data.roomId);
-          if (room) handleCommanderDeath(room, data.loserId, data.winnerId);
-          break;
-        }
+          case 'join_room': {
+            if (ws.isQueued) return;
+            const roomId = typeof data === 'string' ? data : data.roomId; 
+            const password = typeof data === 'string' ? '' : data.password; 
+            const playerName = data.playerName || `Janissary_${ws.id.substring(0, 3)}`; 
 
-        case 'unit_hit': {
-          if (data.roomId) {
+            const room = rooms.get(roomId); 
+            if (!room) return ws.send(JSON.stringify({ type: "error", data: "Комната не найдена" })); 
+            if (room.status !== 'lobby') return ws.send(JSON.stringify({ type: "error", data: "Битва уже идет!" })); 
+            if (room.password && room.password !== password) return ws.send(JSON.stringify({ type: "error", data: "Неверный пароль!" })); 
+
+            joinRoomInternal(ws, roomId, playerName, false); 
+            break;
+          }
+
+          case 'leave_room': {
+            handlePlayerLeaving(ws);
+            if (ws.roomId) ws.unsubscribe(ws.roomId);
+            ws.roomId = null;
+            sendRoomList();
+            break;
+          }
+
+          case 'update_player_name': {
             const room = rooms.get(data.roomId);
             if (room) {
-              const attacker = room.players.find(p => p.id === data.attackerId);
-              const victim = room.players.find(p => p.id === data.targetPlayerId);
-              
-              // NEW: Изоляция урона - подземные игроки неуязвимы и не могут атаковать
-              if (victim && victim.isUnderground) {
-                return console.log(`[COMBAT ARBITER] Hit blocked: victim ${victim.id} is underground`);
+              const p = room.players.find(player => player.id === ws.id);
+              if (p) {
+                p.name = data.name;
+                p.empireId = data.empireId;
+                broadcastToRoom(data.roomId, { type: "room_update", data: room });
               }
-              if (attacker && attacker.isUnderground) {
-                return console.log(`[COMBAT ARBITER] Hit blocked: attacker ${attacker.id} is underground`);
-              }
+            }
+            break;
+          }
 
-              let sourcePos = null;
-              let maxDist = 350; // Базовое расстояние для меча
+          case 'start_match_request': {
+            const room = rooms.get(data);
+            if (room && room.hostId === ws.id) {
+              room.status = 'active';
+              broadcastToRoom(data, { type: "match_started", data: room });
+              sendRoomList();
+            }
+            break;
+          }
 
-              // Если атака от башни
-              if (data.attackerId === 'tower') {
-                 // В данных башни ищем ту, что ближе всего к месту удара (или по ID если добавим)
-                 // Для простоты берем любую башню атакующего в радиусе поражения
-                 const towers = room.buildings.filter(b => b.ownerId === ws.id && b.type !== 'WALL' && b.type !== 'GATE');
-                 const nearestTower = towers.find(t => {
-                    const d = Math.sqrt((t.x - victim.x)**2 + (t.y - victim.y)**2);
-                    return d < 850; // Радиус башни + запас
-                 });
-                 if (nearestTower) {
-                    sourcePos = { x: nearestTower.x, y: nearestTower.y };
-                    maxDist = 850;
-                 }
-              } else if (attacker) {
-                 sourcePos = { x: attacker.x, y: attacker.y };
-                 // Учитываем радиус армии (Кнопка C)
-                 const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
-                 maxDist = armyRadius + 100; 
-              }
+          // --- БОЕВКА И СМЕРТИ (Арбитраж) ---
+          case 'commander_death_detected': {
+            const room = rooms.get(data.roomId);
+            if (room) handleCommanderDeath(room, data.loserId, data.winnerId);
+            break;
+          }
 
-              if (sourcePos && victim) {
-                // ПОДЗЕМЕЛЬЕ: Игнорируем урон, если цель под землей
-                if (victim.isUnderground) {
+          case 'unit_hit': {
+            if (data.roomId) {
+              const room = rooms.get(data.roomId);
+              if (room) {
+                const attacker = room.players.find(p => p.id === data.attackerId);
+                const victim = room.players.find(p => p.id === data.targetPlayerId);
+                
+                // NEW: Изоляция урона - подземные игроки неуязвимы и не могут атаковать
+                if (victim && victim.isUnderground) {
                   return console.log(`[COMBAT ARBITER] Hit blocked: victim ${victim.id} is underground`);
                 }
+                if (attacker && attacker.isUnderground) {
+                  return console.log(`[COMBAT ARBITER] Hit blocked: attacker ${attacker.id} is underground`);
+                }
 
-                const dist = Math.sqrt((sourcePos.x - victim.x)**2 + (sourcePos.y - victim.y)**2);
-                if (dist > maxDist) return console.log(`[COMBAT ARBITER] Hit blocked: distance ${Math.floor(dist)} > ${maxDist}`);
-                
-                // ОБНОВЛЕНИЕ HP В ПАМЯТИ СЕРВЕРА
-                victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
-                data.currentHp = victim.hp; // Добавляем актуальное HP в пакет для рассылки
-                
-                if (victim.hp <= 0 && victim.isAlive !== false) {
-                   handleCommanderDeath(room, victim.id, data.attackerId);
+                let sourcePos = null;
+                let maxDist = 350; // Базовое расстояние для меча
+
+                // Если атака от башни
+                if (data.attackerId === 'tower') {
+                   // В данных башни ищем ту, что ближе всего к месту удара (или по ID если добавим)
+                   // Для простоты берем любую башню атакующего в радиусе поражения
+                   const towers = room.buildings.filter(b => b.ownerId === ws.id && b.type !== 'WALL' && b.type !== 'GATE');
+                   const nearestTower = towers.find(t => {
+                      const d = Math.sqrt((t.x - victim.x)**2 + (t.y - victim.y)**2);
+                      return d < 850; // Радиус башни + запас
+                   });
+                   if (nearestTower) {
+                      sourcePos = { x: nearestTower.x, y: nearestTower.y };
+                      maxDist = 850;
+                   }
+                } else if (attacker) {
+                   sourcePos = { x: attacker.x, y: attacker.y };
+                   // Учитываем радиус армии (Кнопка C)
+                   const armyRadius = (attacker.unitCount || 0) * 0.5 + 150;
+                   maxDist = armyRadius + 100; 
+                }
+
+                if (sourcePos && victim) {
+                  // ПОДЗЕМЕЛЬЕ: Игнорируем урон, если цель под землей
+                  if (victim.isUnderground) {
+                    return console.log(`[COMBAT ARBITER] Hit blocked: victim ${victim.id} is underground`);
+                  }
+
+                  const dist = Math.sqrt((sourcePos.x - victim.x)**2 + (sourcePos.y - victim.y)**2);
+                  if (dist > maxDist) return console.log(`[COMBAT ARBITER] Hit blocked: distance ${Math.floor(dist)} > ${maxDist}`);
+                  
+                  // ОБНОВЛЕНИЕ HP В ПАМЯТИ СЕРВЕРА
+                  victim.hp = Math.max(0, (victim.hp || 100) - (data.damage || 1));
+                  data.currentHp = victim.hp; // Добавляем актуальное HP в пакет для рассылки
+                  
+                  if (victim.hp <= 0 && victim.isAlive !== false) {
+                     handleCommanderDeath(room, victim.id, data.attackerId);
+                  }
+                }
+              }
+              broadcastToRoom(data.roomId, { type: "take_unit_damage", data });
+            }
+            break;
+          }
+
+          case 'tower_fire': {
+            if (data.roomId) ws.publish(data.roomId, JSON.stringify({ type: "remote_tower_fire", data }));
+            break;
+          }
+
+          case 'attack': {
+             if (data.roomId) ws.publish(data.roomId, JSON.stringify({ type: "attack_event", data: { id: ws.id } }));
+             break;
+          }
+
+          // --- ТУННЕЛИ ---
+          case 'tunnel_update': {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              if (!room.tunnels) room.tunnels = [];
+              const newTunnel = { ...data, ownerId: ws.id };
+              const idx = room.tunnels.findIndex(t => t.id === data.id);
+              if (idx !== -1) room.tunnels[idx] = newTunnel;
+              else room.tunnels.push(newTunnel);
+              ws.publish(data.roomId, JSON.stringify({ type: "remote_tunnel_update", data: newTunnel }));
+            }
+            break;
+          }
+
+          case 'tunnel_remove': {
+            const room = rooms.get(data.roomId);
+            if (room && room.tunnels) {
+              room.tunnels = room.tunnels.filter(t => t.id !== data.id);
+              ws.publish(data.roomId, JSON.stringify({ type: "remote_tunnel_remove", data: { id: data.id } }));
+            }
+            break;
+          }
+
+          case 'request_tunnels': {
+            const room = rooms.get(data.roomId);
+            if (room && room.tunnels) {
+              ws.send(JSON.stringify({ type: "sync_tunnels", data: { tunnels: room.tunnels } }));
+            }
+            break;
+          }
+
+          // --- ПОСТРОЙКИ И ЯМЫ ---
+          case 'building_placed': {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              if (data.type === 'tunnel' || data.type === 'pit') {
+                 if (!room.tunnels) room.tunnels = [];
+                 const newTunnel = { ...data, ownerId: ws.id };
+                 room.tunnels.push(newTunnel);
+                 broadcastToRoom(data.roomId, { type: "remote_tunnel_update", data: newTunnel });
+              } else {
+                 const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
+                 room.buildings.push(newBuilding);
+                 broadcastToRoom(data.roomId, { type: "remote_building_placed", data: newBuilding });
+              }
+            }
+            break;
+          }
+
+          case 'building_hit': {
+            if (data.roomId) {
+              const room = rooms.get(data.roomId);
+              if (room) {
+                const attacker = room.players.find(p => p.id === data.attackerId);
+                if (attacker && attacker.isUnderground) {
+                  return console.log(`[COMBAT ARBITER] Building hit blocked: attacker ${attacker.id} is underground`);
+                }
+                ws.publish(data.roomId, JSON.stringify({ type: "remote_building_hit", data }));
+              }
+            }
+            break;
+          }
+
+          case 'building_destroyed': {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              // Сначала ищем в постройках
+              const initialLen = room.buildings.length;
+              room.buildings = room.buildings.filter(b => b.id !== data.buildingId);
+              
+              if (room.buildings.length < initialLen) {
+                 broadcastToRoom(data.roomId, { type: "remote_building_destroyed", data: data.buildingId });
+              } else {
+                 // Если не нашли в постройках, ищем в туннелях (ямах)
+                 if (room.tunnels) {
+                   const tLen = room.tunnels.length;
+                   room.tunnels = room.tunnels.filter(t => t.id !== data.buildingId);
+                   if (room.tunnels.length < tLen) {
+                     broadcastToRoom(data.roomId, { type: "remote_tunnel_remove", data: { id: data.buildingId } });
+                   }
+                 }
+              }
+            }
+            break;
+          }
+
+          case 'hide_pit': {
+            const room = rooms.get(data.roomId);
+            if (room && room.tunnels) {
+              room.tunnels = room.tunnels.filter(t => t.id !== data.id);
+              // BROADCAST PIT REMOVAL TO ALL
+              broadcastToRoom(data.roomId, { type: "pit_removed", data: { id: data.id } });
+            }
+            break;
+          }
+
+          case 'toggle_gate': {
+            const room = rooms.get(data.roomId);
+            if (room) {
+              const gate = room.buildings.find(b => b.id === data.buildingId);
+              if (gate) { gate.isOpen = data.isOpen; broadcastToRoom(data.roomId, { type: "remote_gate_toggled", data }); }
+            }
+            break;
+          }
+
+          case 'garrison_hit': {
+            if (data.roomId) broadcastToRoom(data.roomId, { type: "remote_garrison_hit", data });
+            break;
+          }
+
+          case 'garrison_destroyed': {
+            if (data.roomId) broadcastToRoom(data.roomId, { type: "garrison_destroyed", data });
+            break;
+          }
+
+          // --- РЕМАТЧ ---
+          case 'vote_rematch': {
+            const room = rooms.get(data);
+            if (room) {
+              const player = room.players.find(p => p.id === ws.id);
+              if (player && !player.votedForRematch) {
+                player.votedForRematch = true;
+                room.rematchVotes = (room.rematchVotes || 0) + 1;
+                broadcastToRoom(data, { 
+                  type: "update_rematch_votes", 
+                  data: { votedPlayers: room.rematchVotes, maxPlayers: room.players.length } 
+                });
+
+                if (room.rematchVotes >= room.players.length) {
+                  room.rematchVotes = 0; room.status = 'lobby'; room.buildings = []; room.tunnels = [];
+                  room.players.forEach(p => { p.votedForRematch = false; p.hp = 100; p.isAlive = true; });
+                  broadcastToRoom(data, { type: "rematch_started", data: room });
+                  sendRoomList();
                 }
               }
             }
-            broadcastToRoom(data.roomId, { type: "take_unit_damage", data });
+            break;
           }
-          break;
         }
-
-        case 'tower_fire': {
-          if (data.roomId) ws.publish(data.roomId, JSON.stringify({ type: "remote_tower_fire", data }));
-          break;
-        }
-
-        case 'attack': {
-           if (data.roomId) ws.publish(data.roomId, JSON.stringify({ type: "attack_event", data: { id: ws.id } }));
-           break;
-        }
-
-        // --- ТУННЕЛИ ---
-        case 'tunnel_update': {
-          const room = rooms.get(data.roomId);
-          if (room) {
-            if (!room.tunnels) room.tunnels = [];
-            const newTunnel = { ...data, ownerId: ws.id };
-            const idx = room.tunnels.findIndex(t => t.id === data.id);
-            if (idx !== -1) room.tunnels[idx] = newTunnel;
-            else room.tunnels.push(newTunnel);
-            ws.publish(data.roomId, JSON.stringify({ type: "remote_tunnel_update", data: newTunnel }));
-          }
-          break;
-        }
-
-        case 'tunnel_remove': {
-          const room = rooms.get(data.roomId);
-          if (room && room.tunnels) {
-            room.tunnels = room.tunnels.filter(t => t.id !== data.id);
-            ws.publish(data.roomId, JSON.stringify({ type: "remote_tunnel_remove", data: { id: data.id } }));
-          }
-          break;
-        }
-
-        case 'request_tunnels': {
-          const room = rooms.get(data.roomId);
-          if (room && room.tunnels) {
-            ws.send(JSON.stringify({ type: "sync_tunnels", data: { tunnels: room.tunnels } }));
-          }
-          break;
-        }
-
-        // --- ПОСТРОЙКИ И ЯМЫ ---
-        case 'building_placed': {
-          const room = rooms.get(data.roomId);
-          if (room) {
-            if (data.type === 'tunnel' || data.type === 'pit') {
-               if (!room.tunnels) room.tunnels = [];
-               const newTunnel = { ...data, ownerId: ws.id };
-               room.tunnels.push(newTunnel);
-               broadcastToRoom(data.roomId, { type: "remote_tunnel_update", data: newTunnel });
-            } else {
-               const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
-               room.buildings.push(newBuilding);
-               broadcastToRoom(data.roomId, { type: "remote_building_placed", data: newBuilding });
-            }
-          }
-          break;
-        }
-
-        case 'building_hit': {
-          if (data.roomId) {
-            const room = rooms.get(data.roomId);
-            if (room) {
-              const attacker = room.players.find(p => p.id === data.attackerId);
-              if (attacker && attacker.isUnderground) {
-                return console.log(`[COMBAT ARBITER] Building hit blocked: attacker ${attacker.id} is underground`);
-              }
-              ws.publish(data.roomId, JSON.stringify({ type: "remote_building_hit", data }));
-            }
-          }
-          break;
-        }
-
-        case 'building_destroyed': {
-          const room = rooms.get(data.roomId);
-          if (room) {
-            // Сначала ищем в постройках
-            const initialLen = room.buildings.length;
-            room.buildings = room.buildings.filter(b => b.id !== data.buildingId);
-            
-            if (room.buildings.length < initialLen) {
-               broadcastToRoom(data.roomId, { type: "remote_building_destroyed", data: data.buildingId });
-            } else {
-               // Если не нашли в постройках, ищем в туннелях (ямах)
-               if (room.tunnels) {
-                 const tLen = room.tunnels.length;
-                 room.tunnels = room.tunnels.filter(t => t.id !== data.buildingId);
-                 if (room.tunnels.length < tLen) {
-                   broadcastToRoom(data.roomId, { type: "remote_tunnel_remove", data: { id: data.buildingId } });
-                 }
-               }
-            }
-          }
-          break;
-        }
-
-        case 'hide_pit': {
-          const room = rooms.get(data.roomId);
-          if (room && room.tunnels) {
-            room.tunnels = room.tunnels.filter(t => t.id !== data.id);
-            // BROADCAST PIT REMOVAL TO ALL
-            broadcastToRoom(data.roomId, { type: "pit_removed", data: { id: data.id } });
-          }
-          break;
-        }
-
-        case 'toggle_gate': {
-          const room = rooms.get(data.roomId);
-          if (room) {
-            const gate = room.buildings.find(b => b.id === data.buildingId);
-            if (gate) { gate.isOpen = data.isOpen; broadcastToRoom(data.roomId, { type: "remote_gate_toggled", data }); }
-          }
-          break;
-        }
-
-        case 'garrison_hit': {
-          if (data.roomId) broadcastToRoom(data.roomId, { type: "remote_garrison_hit", data });
-          break;
-        }
-
-        case 'garrison_destroyed': {
-          if (data.roomId) broadcastToRoom(data.roomId, { type: "garrison_destroyed", data });
-          break;
-        }
-
-        // --- РЕМАТЧ ---
-        case 'vote_rematch': {
-          const room = rooms.get(data);
-          if (room) {
-            const player = room.players.find(p => p.id === ws.id);
-            if (player && !player.votedForRematch) {
-              player.votedForRematch = true;
-              room.rematchVotes = (room.rematchVotes || 0) + 1;
-              broadcastToRoom(data, { 
-                type: "update_rematch_votes", 
-                data: { votedPlayers: room.rematchVotes, maxPlayers: room.players.length } 
-              });
-
-              if (room.rematchVotes >= room.players.length) {
-                room.rematchVotes = 0; room.status = 'lobby'; room.buildings = []; room.tunnels = [];
-                room.players.forEach(p => { p.votedForRematch = false; p.hp = 100; p.isAlive = true; });
-                broadcastToRoom(data, { type: "rematch_started", data: room });
-                sendRoomList();
-              }
-            }
-          }
-          break;
-        }
+      } catch (e) {
+        console.error("JSON Parse error", e);
       }
-    } catch (e) {
-      console.error("JSON Parse error", e);
-    }
-  },
+    },
 
-  close: (ws) => {
-    if (ws.isQueued) { 
-      const idx = waitingQueue.indexOf(ws); 
-      if (idx !== -1) waitingQueue.splice(idx, 1); 
-      waitingQueue.forEach((sq, i) => sq.send(JSON.stringify({ type: "queue_update", data: { position: i + 1 } }))); 
-    } else { 
-      activeConnections--; 
-      if (waitingQueue.length > 0) { 
-        const nextWs = waitingQueue.shift(); 
-        nextWs.isQueued = false; 
-        activeConnections++; 
-        nextWs.send(JSON.stringify({ type: "queue_approved" })); 
-        sendRoomList(); 
+    close: (ws) => {
+      if (ws.isQueued) { 
+        const idx = waitingQueue.indexOf(ws); 
+        if (idx !== -1) waitingQueue.splice(idx, 1); 
         waitingQueue.forEach((sq, i) => sq.send(JSON.stringify({ type: "queue_update", data: { position: i + 1 } }))); 
+      } else { 
+        activeConnections--; 
+        if (waitingQueue.length > 0) { 
+          const nextWs = waitingQueue.shift(); 
+          nextWs.isQueued = false; 
+          activeConnections++; 
+          nextWs.send(JSON.stringify({ type: "queue_approved" })); 
+          sendRoomList(); 
+          waitingQueue.forEach((sq, i) => sq.send(JSON.stringify({ type: "queue_update", data: { position: i + 1 } }))); 
+        } 
+        broadcast({ type: "server_capacity", data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } }); 
       } 
-      broadcast({ type: "server_capacity", data: { active: activeConnections, max: MAX_GLOBAL_PLAYERS } }); 
-    } 
 
-    handlePlayerLeaving(ws);
-    sendRoomList(); 
-  }
-}).listen(PORT, (token) => {
-  if (token) {
-    console.log(`--- SULTAN ENGINE v1.8.2 (uWS+BINARY) ONLINE: ${PORT} ---`);
-  } else {
-    console.log(`Failed to listen on port ${PORT}`);
-  }
-});
+      handlePlayerLeaving(ws);
+      sendRoomList(); 
+    }
+  }).listen('0.0.0.0', Number(PORT), (token) => {
+    if (token) {
+      console.log(`--- SULTAN ENGINE v1.8.2 (uWS+BINARY) ONLINE: ${PORT} ---`);
+      console.log(`--- SERVER IS LIVE ON PORT ${PORT} ---`);
+    } else {
+      console.log(`Failed to listen on port ${PORT}`);
+    }
+  });
+} catch (err) {
+  console.error("FATAL ERROR DURING STARTUP:", err);
+}
 
 function joinRoomInternal(ws, roomId, defaultName, isHost) { 
   if (ws.isQueued) return; 
