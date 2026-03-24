@@ -5,6 +5,8 @@ const PORT = Number(process.env.PORT || 3001);
 const MAX_GLOBAL_PLAYERS = 1000;
 const SYNC_PACKET_HEADER_SIZE = 25;
 const SYNC_PACKET_UNIT_COUNT_SENTINEL = 0xffffffff;
+const TUNNEL_LIFETIME_MS = 20000;
+const TUNNEL_SWEEP_INTERVAL_MS = 1000;
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -99,6 +101,77 @@ function approveNextQueuedClient(server) {
   refreshQueuePositions();
 }
 
+function normalizeSplitMode(mode) {
+  return mode === 'HUNT' || mode === 'RECALL' ? mode : 'HOLD';
+}
+
+function upsertStructure(list, item) {
+  const idx = list.findIndex((entry) => entry.id === item.id);
+  if (idx === -1) list.push(item);
+  else list[idx] = item;
+}
+
+function broadcastPlayerState(server, room, player, extraData = {}) {
+  if (!room || !player) return;
+
+  broadcastToRoom(server, room.id, {
+    type: 'remote_update',
+    data: {
+      ...extraData,
+      id: player.id,
+      roomId: room.id,
+      x: player.x,
+      y: player.y,
+      hp: player.hp,
+      unitCount: player.unitCount,
+      isUnderground: player.isUnderground,
+      faction: player.faction,
+      empireId: player.empireId,
+      name: player.name
+    }
+  });
+}
+
+function purgePlayerOwnedWorldState(server, room, playerId) {
+  if (!room) return;
+
+  const removedBuildingIds = room.buildings
+    .filter((building) => building.ownerId === playerId)
+    .map((building) => building.id);
+  if (removedBuildingIds.length > 0) {
+    room.buildings = room.buildings.filter((building) => building.ownerId !== playerId);
+    removedBuildingIds.forEach((buildingId) => {
+      broadcastToRoom(server, room.id, { type: 'remote_building_destroyed', data: buildingId });
+    });
+  }
+
+  const removedTunnelIds = (room.tunnels || [])
+    .filter((tunnel) => tunnel.ownerId === playerId)
+    .map((tunnel) => tunnel.id);
+  if (removedTunnelIds.length > 0) {
+    room.tunnels = room.tunnels.filter((tunnel) => tunnel.ownerId !== playerId);
+    removedTunnelIds.forEach((tunnelId) => {
+      broadcastToRoom(server, room.id, { type: 'remote_tunnel_remove', data: { id: tunnelId } });
+    });
+  }
+}
+
+function cleanupSocketState(ws) {
+  try {
+    ws.unsubscribe('global');
+  } catch {}
+
+  if (ws.roomId) {
+    try {
+      ws.unsubscribe(ws.roomId);
+    } catch {}
+  }
+
+  ws.roomId = null;
+  ws.isQueued = false;
+  ws.closed = true;
+}
+
 function handleCommanderDeath(server, room, loserId, winnerId = null) {
   if (!room || room.status !== 'active') return;
 
@@ -142,6 +215,8 @@ function handlePlayerLeaving(server, ws) {
   if (playerIndex !== -1) {
     room.players.splice(playerIndex, 1);
   }
+
+  purgePlayerOwnedWorldState(server, room, ws.id);
 
   if (room.hostId === ws.id && room.players.length > 0) {
     const nextHost = room.players[0];
@@ -316,13 +391,7 @@ server.ws('/*', {
         if (syncData.faction) player.faction = syncData.faction;
       }
 
-      broadcastToRoom(server, roomId, {
-        type: 'remote_update',
-        data: {
-          id: ws.id,
-          ...syncData
-        }
-      });
+      broadcastPlayerState(server, room, player, syncData);
 
       return;
     }
@@ -366,6 +435,7 @@ server.ws('/*', {
           if (!room) return send(ws, 'error', 'Комната не найдена');
           if (room.status !== 'lobby') return send(ws, 'error', 'Битва уже идет!');
           if (room.password && room.password !== password) return send(ws, 'error', 'Неверный пароль!');
+          if (room.players.length >= room.maxPlayers) return send(ws, 'error', 'Комната заполнена');
           joinRoomInternal(server, ws, roomId, playerName, false);
           break;
         }
@@ -386,6 +456,57 @@ server.ws('/*', {
               broadcastToRoom(server, data.roomId, { type: 'room_update', data: serializeRoom(room) });
             }
           }
+          break;
+        }
+
+        case 'request_split': {
+          const roomId = data.roomId || ws.roomId;
+          const room = rooms.get(roomId);
+          if (!room) {
+            send(ws, 'split_result', { success: false });
+            break;
+          }
+
+          const player = room.players.find((entry) => entry.id === ws.id);
+          if (!player) {
+            send(ws, 'split_result', { success: false });
+            break;
+          }
+
+          const strategy = data.strategy === 'SEPARATE_ALL' ? 'SEPARATE_ALL' : 'HALF';
+          const mode = normalizeSplitMode(data.mode);
+          const currentUnitCount = Math.max(1, Math.floor(player.unitCount || 1));
+
+          if (strategy === 'SEPARATE_ALL') {
+            if (currentUnitCount <= 1) {
+              send(ws, 'split_result', { success: false, strategy, mode });
+              break;
+            }
+          } else if (currentUnitCount < 15) {
+            send(ws, 'split_result', { success: false, strategy, mode });
+            break;
+          }
+
+          const splitCount = strategy === 'SEPARATE_ALL'
+            ? Math.max(0, currentUnitCount - 1)
+            : Math.floor(currentUnitCount / 2);
+
+          if (splitCount <= 0) {
+            send(ws, 'split_result', { success: false, strategy, mode });
+            break;
+          }
+
+          player.unitCount = Math.max(1, currentUnitCount - splitCount);
+
+          send(ws, 'split_result', {
+            success: true,
+            strategy,
+            mode,
+            splitCount,
+            remainingUnitCount: player.unitCount
+          });
+
+          broadcastPlayerState(server, room, player, data);
           break;
         }
 
@@ -422,8 +543,7 @@ server.ws('/*', {
               broadcastToRoom(server, data.roomId, {
                 type: 'sync_world',
                 data: {
-                  neutrals: data.neutrals || [],
-                  towers: data.towers || []
+                  neutrals: data.neutrals || []
                 }
               });
             }
@@ -522,10 +642,8 @@ server.ws('/*', {
           const room = rooms.get(data.roomId);
           if (room) {
             if (!room.tunnels) room.tunnels = [];
-            const newTunnel = { ...data, ownerId: ws.id };
-            const idx = room.tunnels.findIndex((tunnel) => tunnel.id === data.id);
-            if (idx !== -1) room.tunnels[idx] = newTunnel;
-            else room.tunnels.push(newTunnel);
+            const newTunnel = { ...data, ownerId: ws.id, createdAt: Date.now() };
+            upsertStructure(room.tunnels, newTunnel);
             broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_update', data: newTunnel });
           }
           break;
@@ -545,12 +663,16 @@ server.ws('/*', {
           if (room) {
             if (data.type === 'tunnel' || data.type === 'pit') {
               if (!room.tunnels) room.tunnels = [];
-              const newTunnel = { ...data, ownerId: ws.id };
-              room.tunnels.push(newTunnel);
+              const newTunnel = { ...data, ownerId: ws.id, createdAt: Date.now() };
+              upsertStructure(room.tunnels, newTunnel);
               broadcastToRoom(server, data.roomId, { type: 'remote_tunnel_update', data: newTunnel });
             } else {
-              const newBuilding = { ...data, ownerId: ws.id, isOpen: false };
-              room.buildings.push(newBuilding);
+              const newBuilding = {
+                ...data,
+                ownerId: ws.id,
+                isOpen: data.type === 'GATE' || data.type === 'gate' ? !!data.isOpen : false
+              };
+              upsertStructure(room.buildings, newBuilding);
               broadcastToRoom(server, data.roomId, { type: 'remote_building_placed', data: newBuilding });
             }
           }
@@ -656,12 +778,13 @@ server.ws('/*', {
   },
 
   close: (ws) => {
-    ws.closed = true;
     socketsById.delete(ws.id);
+    removeFromWaitingQueue(ws);
 
     if (ws.isQueued) {
-      removeFromWaitingQueue(ws);
+      cleanupSocketState(ws);
       refreshQueuePositions();
+      updateServerCapacity(server);
       return;
     }
 
@@ -670,10 +793,33 @@ server.ws('/*', {
     }
 
     handlePlayerLeaving(server, ws);
+    cleanupSocketState(ws);
     sendRoomList(server);
     approveNextQueuedClient(server);
   }
 });
+
+setInterval(() => {
+  const now = Date.now();
+
+  rooms.forEach((room) => {
+    if (!room.tunnels || room.tunnels.length === 0) return;
+
+    const expiredTunnelIds = room.tunnels
+      .filter((tunnel) => now - (tunnel.createdAt || now) > TUNNEL_LIFETIME_MS)
+      .map((tunnel) => tunnel.id);
+
+    if (expiredTunnelIds.length === 0) return;
+
+    room.tunnels = room.tunnels.filter((tunnel) => !expiredTunnelIds.includes(tunnel.id));
+    expiredTunnelIds.forEach((tunnelId) => {
+      broadcastToRoom(server, room.id, {
+        type: 'remote_tunnel_remove',
+        data: { id: tunnelId }
+      });
+    });
+  });
+}, TUNNEL_SWEEP_INTERVAL_MS);
 
 server.listen('0.0.0.0', PORT, (token) => {
   if (token) {
