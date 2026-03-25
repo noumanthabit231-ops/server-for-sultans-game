@@ -13,6 +13,7 @@ const WORLD_STATE_INTERVAL_MS = 50;
 const NPC_MOVE_SPEED = 10;
 const NPC_MELEE_RANGE = 85;
 const PIT_DAMAGE_COOLDOWN_MS = 350;
+const DEBUG_COMBAT = process.env.DEBUG_COMBAT !== '0';
 
 const decoder = new TextDecoder();
 const rooms = new Map();
@@ -20,6 +21,15 @@ const socketsById = new Map();
 const waitingQueue = [];
 
 let activeConnections = 0;
+
+function combatLog(event, payload = {}) {
+  if (!DEBUG_COMBAT) return;
+  try {
+    console.log(`[combat] ${event} ${JSON.stringify(payload)}`);
+  } catch {
+    console.log(`[combat] ${event}`);
+  }
+}
 
 function getDistance(x1, y1, x2, y2) {
   return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
@@ -230,6 +240,10 @@ function applyDamage(server, room, targetId, amount, metadata = {}) {
 
   const player = room.players.find((entry) => entry.id === targetId);
   if (player) {
+    const before = {
+      unitCount: Math.max(0, Math.floor(player.unitCount || 0)),
+      hp: Number.isFinite(player.hp) ? player.hp : COMMANDER_MAX_HP
+    };
     const hitCount = Math.max(1, Math.floor(amount || 1));
     for (let i = 0; i < hitCount; i++) {
       if (player.unitCount > 0) {
@@ -238,6 +252,18 @@ function applyDamage(server, room, targetId, amount, metadata = {}) {
         player.hp = Math.max(0, (Number.isFinite(player.hp) ? player.hp : COMMANDER_MAX_HP) - COMMANDER_HIT_DAMAGE);
       }
     }
+    combatLog('apply_damage_player', {
+      roomId: room.id,
+      targetId,
+      attackerId: metadata.attackerId || null,
+      source: metadata.source || 'applyDamage',
+      amount: hitCount,
+      before,
+      after: {
+        unitCount: player.unitCount,
+        hp: player.hp
+      }
+    });
 
     broadcastPlayerState(server, room, player, {
       currentHp: player.hp,
@@ -775,6 +801,39 @@ server.ws('/*', {
           break;
         }
 
+        case 'dismiss_units': {
+          const roomId = data.roomId || ws.roomId;
+          const room = rooms.get(roomId);
+          if (!room) break;
+
+          const player = room.players.find((entry) => entry.id === ws.id);
+          if (!player) break;
+
+          const currentUnitCount = Math.max(0, Math.floor(player.unitCount || 0));
+          const requestedCount = data.count === 'ALL'
+            ? currentUnitCount
+            : Math.max(0, Math.floor(data.count || 0));
+          const removedCount = Math.min(currentUnitCount, requestedCount);
+          if (removedCount <= 0) break;
+
+          combatLog('dismiss_units', {
+            roomId,
+            playerId: player.id,
+            requestedCount: data.count,
+            currentUnitCount,
+            removedCount
+          });
+
+          player.unitCount = currentUnitCount - removedCount;
+          player.akce = Math.max(0, Math.floor(player.akce || 0)) + (removedCount * 5);
+
+          broadcastPlayerState(server, room, player, {
+            akce: player.akce,
+            currentUnitCount: player.unitCount
+          });
+          break;
+        }
+
         case 'start_match_request': {
           const roomId = typeof data === 'string' ? data : data.roomId;
           const room = rooms.get(roomId);
@@ -840,7 +899,14 @@ server.ws('/*', {
               const sameLayer = attacker && victim
                 ? attacker.isUnderground === victim.isUnderground
                 : !(victim && victim.isUnderground);
-              if (!sameLayer) return;
+              if (!sameLayer) {
+                combatLog('unit_hit_ignored_layer', {
+                  roomId: data.roomId,
+                  attackerId: data.attackerId,
+                  targetPlayerId: data.targetPlayerId
+                });
+                return;
+              }
 
               let sourcePos = null;
               let maxDist = 250;
@@ -860,11 +926,38 @@ server.ws('/*', {
 
               if (sourcePos && victim) {
                 const dist = getDistance(sourcePos.x, sourcePos.y, victim.x, victim.y);
-                if (dist > maxDist) return;
+                combatLog('unit_hit_received', {
+                  roomId: data.roomId,
+                  attackerId: data.attackerId,
+                  targetPlayerId: data.targetPlayerId,
+                  attackerUnitCount: attacker ? attacker.unitCount : null,
+                  victimUnitCount: victim.unitCount,
+                  victimHp: victim.hp,
+                  dist,
+                  maxDist
+                });
+                if (dist > maxDist) {
+                  combatLog('unit_hit_ignored_range', {
+                    roomId: data.roomId,
+                    attackerId: data.attackerId,
+                    targetPlayerId: data.targetPlayerId,
+                    dist,
+                    maxDist
+                  });
+                  return;
+                }
                 applyDamage(server, room, victim.id, 1, {
                   attackerId: data.attackerId,
                   attackerName: data.attackerName,
                   source: 'unit_hit'
+                });
+              } else {
+                combatLog('unit_hit_missing_source', {
+                  roomId: data.roomId,
+                  attackerId: data.attackerId,
+                  targetPlayerId: data.targetPlayerId,
+                  hasAttacker: !!attacker,
+                  hasVictim: !!victim
                 });
               }
             }
