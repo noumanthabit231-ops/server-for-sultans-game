@@ -1,8 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodePackages.nodejs"]
+nixPkgs = ["nodejs_22"]
 
 [phases.build]
 cmds = ["npm install"]
 
 [phases.start]
-cmd = "node server.js"
+cmd = "npm start"
